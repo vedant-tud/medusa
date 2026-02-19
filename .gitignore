@@ -12,3 +12,6 @@ __pycache__/
 
 # Ignore Mac system files
 .DS_Store
+
+# Ignore all PDF files anywhere in the project
+*.pdf
