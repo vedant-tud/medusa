@@ -1,0 +1,5 @@
+data/*
+*desktop.ini
+.venv/
+__pycache__/
+*.zip

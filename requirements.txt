@@ -1,0 +1,7 @@
+configobj
+numpy
+opencv-python
+scipy
+setproctitle
+tensorflow
+tqdm
