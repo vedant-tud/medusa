@@ -1,0 +1,157 @@
+# Micro-Expression Pipeline: Riesz EVM + RAFT
+## Overview
+
+This pipeline processes micro-expression videos through two stages:
+
+1. **Riesz Pyramid Eulerian Video Magnification (EVM)** — enhances subtle facial
+   muscle movements by amplifying temporal phase changes in the 0.2–4 Hz band.
+   Amplification ramps from α=1 at onset → α=20 at the apex frame → α=1 at end.
+
+2. **RAFT Optical Flow** — computes dense optical flow between the original onset
+   frame (frame 0) and the magnified apex frame, saving each as a `.npy` array.
+
+---
+
+## Expected Folder Structure
+
+```
+medusa/
+├── dataset/
+│   ├── anger/
+│   ├── happy/
+│   ├── disgust/
+│   ├── sad/
+│   ├── fear/
+│   └── surprise/
+└── video_emotion_metadata_v2.csv
+```
+
+### CSV Format
+```
+Subject,Emotion,Filename,Apex Frame
+Person_1,anger,MYS_G000010_..._Sample_442.mp4,32
+```
+
+---
+
+## Setup
+
+### 1. Create a virtual environment
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+### 2. Install PyTorch (Apple Silicon MPS)
+```bash
+pip install torch torchvision
+```
+
+### 3. Install remaining dependencies
+```bash
+pip install -r requirements.txt
+```
+
+> **Note:** The pipeline will automatically attempt to load RAFT via
+> `torchvision.models.optical_flow.raft_large` (available in torchvision ≥ 0.13).
+> If that fails, it will try to load from a local RAFT repo (see fallback below).
+
+---
+
+## Running the Pipeline
+
+```bash
+python evm_raft_pipeline.py \
+    --medusa_root medusa \
+    --output_dir  output
+```
+
+### All Arguments
+
+| Argument        | Default  | Description                                      |
+|-----------------|----------|--------------------------------------------------|
+| `--medusa_root` | `medusa` | Path to the medusa/ root directory               |
+| `--output_dir`  | `output` | Where outputs are saved                          |
+| `--alpha_max`   | `20.0`   | Peak EVM amplification at apex frame             |
+| `--freq_low`    | `0.2`    | Bandpass low frequency (Hz)                      |
+| `--freq_high`   | `4.0`    | Bandpass high frequency (Hz)                     |
+| `--levels`      | `4`      | Riesz pyramid levels                             |
+| `--raft_iters`  | `20`     | RAFT refinement iterations                       |
+
+---
+
+## Outputs
+
+```
+output/
+├── flow/
+│   ├── MYS_G000010_..._Sample_442.npy   ← H×W×2 flow field per video
+│   └── ...
+├── previews/
+│   ├── anger_preview.mp4                ← one magnified video per emotion
+│   ├── happy_preview.mp4
+│   ├── disgust_preview.mp4
+│   ├── sad_preview.mp4
+│   ├── fear_preview.mp4
+│   └── surprise_preview.mp4
+├── weights/
+│   └── raft-things.pth                  ← auto-downloaded on first run
+├── flow_manifest.csv                    ← maps every .npy to label/subject
+└── pipeline.log
+```
+
+### Flow Manifest CSV
+
+```
+filename, emotion, subject, apex_frame, onset_frame, flow_path, flow_shape
+MYS_..._Sample_442.mp4, anger, Person_1, 32, 0, output/flow/..., 240x320x2
+```
+
+This is the file your downstream Transformer should load to pair flow fields
+with their emotion labels and subject IDs.
+
+### Flow Array Format
+
+Each `.npy` file is a `H × W × 2` float32 array:
+- `flow[:, :, 0]` → horizontal displacement (u)
+- `flow[:, :, 1]` → vertical displacement (v)
+
+---
+
+## RAFT Fallback (if torchvision RAFT fails)
+
+If `torchvision.models.optical_flow` is unavailable, clone the RAFT repo
+next to the pipeline script:
+
+```bash
+git clone https://github.com/princeton-vl/RAFT.git
+pip install -r RAFT/requirements.txt
+```
+
+The pipeline will automatically detect and use the local repo.
+
+---
+
+## Technical Notes
+
+### Riesz Pyramid EVM
+- Uses the **Riesz steerable pyramid** (spatial quadrature pair) for local phase
+  estimation — more principled than Laplacian-only EVM for oriented micro-motion.
+- Temporal bandpass is applied to the **phase signal** at each pyramid level and
+  spatial location independently, then the amplified phase shift is applied via
+  the Riesz reconstruction formula.
+- Only the luminance channel is magnified; chrominance is left unchanged to avoid
+  colour artefacts.
+
+### Alpha Ramp
+```
+α(t) = 1 + (20-1) * (t / apex_idx)        for t ≤ apex_idx
+α(t) = 20 - (20-1) * ((t-apex_idx) / rem)  for t > apex_idx
+```
+This prevents jitter during neutral/onset phases and concentrates amplification
+exactly at the apex — where micro-expression signal is strongest.
+
+### RAFT Flow
+- Runs on **onset frame (frame 0, original) → amplified apex frame**.
+- Input frames are zero-padded to multiples of 8 before inference, then cropped.
+- MPS acceleration is used automatically on Apple Silicon.

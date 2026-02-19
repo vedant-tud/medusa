@@ -1,0 +1,13 @@
+# Micro-Expression Pipeline – Python dependencies
+# Tested on macOS (Apple M4, Python 3.10+)
+
+# Core scientific stack
+numpy>=1.24
+scipy>=1.10
+opencv-python>=4.8
+
+# PyTorch – install separately for Apple Silicon MPS support:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# (MPS is built into standard torch for macOS, no special index needed for M4)
+torch>=2.1
+torchvision>=0.16

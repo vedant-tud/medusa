@@ -1,0 +1,14 @@
+# Ignore the virtual environment
+venv/
+.env
+
+# Ignore data and results (highly recommended)
+data/
+output/
+
+# Ignore Python cache
+__pycache__/
+*.py[cod]
+
+# Ignore Mac system files
+.DS_Store
