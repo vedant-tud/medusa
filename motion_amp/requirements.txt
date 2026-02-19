@@ -1,0 +1,6 @@
+torch==2.7.0
+torchvision
+opencv-python
+scikit-image
+scikit-learn
+ipykernel
