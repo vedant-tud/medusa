@@ -8,4 +8,5 @@ __pycache__/
 best_baseline_subj1.pth
 best_baseline_subj2.pth
 best_baseline_subj3.pth
+quick_test.pth
 sample_log.csv
