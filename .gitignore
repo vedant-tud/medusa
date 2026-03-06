@@ -5,5 +5,7 @@ casme_processed/
 __pycache__/
 *.zip
 .env
-*.pth
+best_baseline_subj1.pth.pth
+best_baseline_subj2.pth.pth
+best_baseline_subj3.pth.pth
 sample_log.csv
