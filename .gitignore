@@ -5,3 +5,5 @@ casme_processed/
 __pycache__/
 *.zip
 .env
+*.pth
+sample_log.csv
