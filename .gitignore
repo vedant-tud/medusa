@@ -1,4 +1,5 @@
 data/*
+casme_processed/
 *desktop.ini
 .venv/
 __pycache__/
