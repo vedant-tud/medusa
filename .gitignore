@@ -1,6 +1,9 @@
 data/*
 *desktop.ini
 .venv/
+.venv_medusa/
 __pycache__/
 *.zip
 .env
+casme_processed/*
+casme_raft_processed/*
