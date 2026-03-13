@@ -6,4 +6,5 @@ __pycache__/
 *.zip
 .env
 casme_processed/*
-casme_raft_processed/*
+casme_raft_processed*/*
+.cache/*

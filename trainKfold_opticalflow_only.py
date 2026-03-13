@@ -10,6 +10,11 @@ Run:
 """
 
 import os
+
+# Set cache directories before importing torch/torchvision/huggingface to read offline weights
+os.environ["TORCH_HOME"] = "/scratch/smiyyapuram/medusa/.cache/torch"
+os.environ["HF_HOME"] = "/scratch/smiyyapuram/medusa/.cache/huggingface"
+
 import gc
 import argparse
 import warnings
@@ -32,16 +37,20 @@ from typing import Optional, List, Dict, Tuple
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+
 CONFIG = {
-    "data_root":        "./casme_raft_processed",
-    "sample_log_path":  "sample_log.csv",
+    "data_root":        "./casme_raft_processed10",
+    "sample_log_path":  "./save_exp_1/sample_log.csv",
     "num_classes":      7,
-    "image_size":       224,
+    "image_size":       256,      # <--- CHANGE THIS FROM 224 TO 256
     "pretrained":       True,
-    "sample_per_class": 100,      # ignored when --all-data is set
-    "epochs":           50,       # higher ceiling — early stopping will cut this short
-    "early_stop_patience": 7,     # stop if val acc doesn't improve for 7 epochs
-    "batch_size":       16,
+    "sample_per_class": 100,      
+    "epochs":           100,      
+    "early_stop_patience": 30,    
+    "batch_size":      8,
     "lr":               1e-4,
     "weight_decay":     1e-4,
     "label_smoothing":  0.1,
@@ -49,7 +58,7 @@ CONFIG = {
     "warmup_epochs":    5,
     "seed":             42,
     "num_workers":      4,
-    "save_path":        "best_baseline.pth",
+    "save_path":        "./save_exp_1/best_baseline.pth",
 }
 
 LABEL_MAP = {
@@ -213,10 +222,52 @@ def align_and_crop_face(img: np.ndarray, target_size: int = 224) -> np.ndarray:
 # DATASET
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DATASET & PREPROCESSING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def flow_to_rgb_heatmap(flow_npy: np.ndarray) -> np.ndarray:
+    """
+    Converts a (2, H, W) optical flow array into a (3, H, W) RGB heatmap.
+    Uses dynamic normalization to act as an 'auto-gain' for micro-expressions.
+    """
+    # 1. Transpose to (H, W, 2) for OpenCV processing
+    flow = flow_npy.transpose(1, 2, 0)
+    u, v = flow[..., 0], flow[..., 1]
+    
+    # 2. Calculate Magnitude and Angle
+    mag, ang = cv2.cartToPolar(u, v)
+    
+    # 3. Create HSV image shell
+    hsv = np.zeros((flow.shape[0], flow.shape[1], 3), dtype=np.uint8)
+    
+    # Hue: Map angle to [0, 180] for OpenCV's 8-bit HSV format
+    hsv[..., 0] = ang * 180 / np.pi / 2
+    
+    # Saturation: Max out saturation for vibrant colors
+    hsv[..., 1] = 255
+    
+    # Value (Brightness): Dynamic Normalization
+    # Find the maximum movement in THIS specific clip
+    max_mag = np.max(mag)
+    if max_mag > 1e-5: # Prevent division by zero
+        # Scale the maximum motion to 255 (100% brightness)
+        hsv[..., 2] = (mag / max_mag) * 255
+    else:
+        hsv[..., 2] = 0
+        
+    # 4. Convert HSV to RGB
+    rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+    
+    # 5. Convert back to (3, H, W) float32 in [0, 1] range for PyTorch
+    rgb_tensor = rgb.astype(np.float32) / 255.0
+    return rgb_tensor.transpose(2, 0, 1)
+
 def _make_transform(augment: bool) -> transforms.Compose:
+    # Removed RandomErasing because it destroys sparse optical flow flares.
+    # Added RandomHorizontalFlip to the augment pipeline.
     if augment:
         return transforms.Compose([
-            transforms.RandomErasing(p=0.2, scale=(0.02, 0.1)),
             transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         ])
     else:
@@ -224,9 +275,8 @@ def _make_transform(augment: bool) -> transforms.Compose:
             transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         ])
 
-
 class CasmeBaselineDataset(Dataset):
-    def __init__(self, annotations: pd.DataFrame, image_size: int = 224, augment: bool = False):
+    def __init__(self, annotations: pd.DataFrame, image_size: int = 256, augment: bool = False):
         self.df        = annotations.reset_index(drop=True)
         self.size      = image_size
         self.augment   = augment
@@ -242,40 +292,32 @@ class CasmeBaselineDataset(Dataset):
         use_flip = self.augment and (torch.rand(1).item() > 0.5)
 
         if use_flip:
-            onset_path = row["onset_gray_flip"]
             flow_path  = row["flow_flip_npy"]
         else:
-            onset_path = row["onset_gray"]
             flow_path  = row["flow_npy"]
 
-        # Load onset grayscale image
-        onset_img = cv2.imread(onset_path, cv2.IMREAD_GRAYSCALE)
-        if onset_img is None:
-            onset_img = np.zeros((self.size, self.size), dtype=np.float32)
-        else:
-            onset_img = onset_img.astype(np.float32) / 255.0
-
-        # Load flow (2, H, W)
+        # 1. Load flow (2, H, W)
         try:
-            flow = np.load(flow_path).astype(np.float32) # shape: (2, H, W)
+            flow = np.load(flow_path).astype(np.float32) 
         except:
+            # Fallback to zero motion if file is missing/corrupted
             flow = np.zeros((2, self.size, self.size), dtype=np.float32)
 
-        # Build combined tensor (3, H, W) -> Flow X, Flow Y, Onset Gray
-        combined = np.zeros((3, self.size, self.size), dtype=np.float32)
-        combined[0:2, :, :] = flow
-        # Resize if dimensions dont match
-        if onset_img.shape[0] != self.size or onset_img.shape[1] != self.size:
-            onset_img = cv2.resize(onset_img, (self.size, self.size))
-        
-        combined[2, :, :] = onset_img
+        # 2. Resize if dimensions don't match (RAFT usually outputs exact sizes, but safety first)
+        if flow.shape[1] != self.size or flow.shape[2] != self.size:
+            # Transpose to (H,W,C) for cv2, resize, then back to (C,H,W)
+            flow = flow.transpose(1, 2, 0)
+            flow = cv2.resize(flow, (self.size, self.size))
+            flow = flow.transpose(2, 0, 1)
 
-        tensor_data = torch.from_numpy(combined)
+        # 3. Convert Flow to RGB Heatmap (Geometry-Only Input)
+        rgb_heatmap = flow_to_rgb_heatmap(flow)
+
+        # 4. Apply PyTorch Transforms
+        tensor_data = torch.from_numpy(rgb_heatmap)
         tensor_data = self.transform(tensor_data)
 
         return tensor_data, label
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # MODEL
 # ─────────────────────────────────────────────────────────────────────────────
@@ -303,26 +345,29 @@ class WeightedLabelSmoothingCrossEntropy(nn.Module):
 
         return loss.mean()
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MODEL
+# ─────────────────────────────────────────────────────────────────────────────
 
 class BaselineSwinMER(nn.Module):
     def __init__(self, num_classes: int = 7, pretrained: bool = True):
         super().__init__()
+        # 1. Use the new Swin-v2 256x256 model string
         self.backbone = timm.create_model(
-            "swin_tiny_patch4_window7_224",
+            "swinv2_tiny_window8_256", 
             pretrained=pretrained,
             num_classes=0,
         )
+        
         feat_dim = self.backbone.num_features
         self.classifier = nn.Sequential(
             nn.LayerNorm(feat_dim),
-            nn.Dropout(p=0.5),         # increased from 0.3
+            nn.Dropout(p=0.5),         
             nn.Linear(feat_dim, num_classes),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.classifier(self.backbone(x))
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # TRAINING
 # ─────────────────────────────────────────────────────────────────────────────
