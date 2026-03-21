@@ -4,16 +4,13 @@ train.py — Baseline MER training script
 
 Run:
     python train.py                          # full LOSO with defaults
-    python train.py --epochs 10              # faster run
-    python train.py --sample-per-class 50   # smaller subset
-    python train.py --no-loso               # single train/val split (first subject held out)
+    python train.py --no-loso               # single train/val split
+    python train.py --kfold 10              # 10-fold subject-grouped CV
+    python train.py --kfold 10 --all-data   # use all available clips (no sampling cap)
 """
 
 import os
-import re
 import gc
-import copy
-import time
 import argparse
 import warnings
 warnings.filterwarnings("ignore")
@@ -41,8 +38,9 @@ CONFIG = {
     "num_classes":      7,
     "image_size":       224,
     "pretrained":       True,
-    "sample_per_class": 100,
-    "epochs":           30,
+    "sample_per_class": 100,      # ignored when --all-data is set
+    "epochs":           50,       # higher ceiling — early stopping will cut this short
+    "early_stop_patience": 7,     # stop if val acc doesn't improve for 7 epochs
     "batch_size":       16,
     "lr":               1e-4,
     "weight_decay":     1e-4,
@@ -50,7 +48,7 @@ CONFIG = {
     "grad_clip":        1.0,
     "warmup_epochs":    5,
     "seed":             42,
-    "num_workers":      2,        # works correctly in a .py file (spawn-safe)
+    "num_workers":      4,
     "save_path":        "best_baseline.pth",
 }
 
@@ -80,6 +78,7 @@ def get_device() -> torch.device:
         return torch.device("mps")
     return torch.device("cpu")
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA LOADING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -108,9 +107,9 @@ def _parse_info_txt(path: str) -> Optional[dict]:
         "emotion": fields["emotion"].lower(),
     }
 
+
 def load_casme_processed(data_root: str) -> pd.DataFrame:
     records = []
-
     if not os.path.isdir(data_root):
         raise FileNotFoundError(f"data_root not found: {data_root}")
 
@@ -152,11 +151,9 @@ def load_casme_processed(data_root: str) -> pd.DataFrame:
 def sample_clips(df: pd.DataFrame, n_per_class: int, seed: int = 42) -> pd.DataFrame:
     if df.empty or "emotion" not in df.columns:
         raise ValueError("No clips found — check data_root.")
-
     parts = []
     for _, group in df.groupby("emotion"):
         parts.append(group.sample(min(n_per_class, len(group)), random_state=seed))
-
     sampled = pd.concat(parts).reset_index(drop=True)
     print(f"Sampled {len(sampled)} clips ({n_per_class}/class, seed={seed}):")
     print(sampled["emotion"].value_counts().to_string(), "\n")
@@ -166,6 +163,21 @@ def sample_clips(df: pd.DataFrame, n_per_class: int, seed: int = 42) -> pd.DataF
 def save_sample_log(df: pd.DataFrame, path: str) -> None:
     df[["clip_folder", "subject", "emotion", "emotion_id"]].to_csv(path, index=False)
     print(f"Sample log saved → {path}  ({len(df)} rows)")
+
+
+def compute_class_weights(df: pd.DataFrame, num_classes: int, device: torch.device) -> torch.Tensor:
+    """
+    Inverse-frequency class weights to handle imbalanced data.
+    Classes with fewer samples get higher weight in the loss.
+    """
+    counts = np.zeros(num_classes)
+    for eid, cnt in df["emotion_id"].value_counts().items():
+        counts[int(eid)] = cnt
+    counts = np.where(counts == 0, 1, counts)   # avoid divide-by-zero
+    weights = 1.0 / counts
+    weights = weights / weights.sum() * num_classes  # normalise
+    print("Class weights:", {ID_TO_LABEL[i]: f"{w:.3f}" for i, w in enumerate(weights)})
+    return torch.tensor(weights, dtype=torch.float32, device=device)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -197,17 +209,22 @@ def align_and_crop_face(img: np.ndarray, target_size: int = 224) -> np.ndarray:
 # DATASET
 # ─────────────────────────────────────────────────────────────────────────────
 
-_transform_base = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-])
-
-_transform_aug = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.ColorJitter(brightness=0.15, contrast=0.15),
-    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-])
+def _make_transform(augment: bool) -> transforms.Compose:
+    if augment:
+        return transforms.Compose([
+            transforms.ToTensor(),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(degrees=15),
+            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1),
+            transforms.RandomGrayscale(p=0.1),
+            transforms.RandomErasing(p=0.2, scale=(0.02, 0.1)),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ])
+    else:
+        return transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ])
 
 
 class CasmeBaselineDataset(Dataset):
@@ -215,7 +232,7 @@ class CasmeBaselineDataset(Dataset):
         self.df        = annotations.reset_index(drop=True)
         self.size      = image_size
         self.augment   = augment
-        self.transform = _transform_aug if augment else _transform_base
+        self.transform = _make_transform(augment)
         self._blank    = np.zeros((image_size, image_size, 3), dtype=np.uint8)
 
     def __len__(self):
@@ -235,6 +252,7 @@ class CasmeBaselineDataset(Dataset):
         apex_img  = self._load_jpg(row["apex_path"])
 
         if self.augment:
+            # Same random seed for both frames so spatial augmentations are consistent
             seed = torch.randint(0, 2**32, (1,)).item()
             torch.manual_seed(seed);  onset_t = self.transform(onset_img)
             torch.manual_seed(seed);  apex_t  = self.transform(apex_img)
@@ -249,18 +267,28 @@ class CasmeBaselineDataset(Dataset):
 # MODEL
 # ─────────────────────────────────────────────────────────────────────────────
 
-class LabelSmoothingCrossEntropy(nn.Module):
-    def __init__(self, num_classes: int, smoothing: float = 0.1):
+class WeightedLabelSmoothingCrossEntropy(nn.Module):
+    """Label smoothing cross entropy with per-class weights for imbalanced data."""
+    def __init__(self, num_classes: int, smoothing: float = 0.1,
+                 weight: Optional[torch.Tensor] = None):
         super().__init__()
         self.smoothing = smoothing
         self.n_classes = num_classes
+        self.weight    = weight   # shape: (num_classes,)
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         confidence = 1.0 - self.smoothing
         smooth_val = self.smoothing / (self.n_classes - 1)
         soft_targets = torch.full_like(logits, smooth_val)
         soft_targets.scatter_(1, targets.unsqueeze(1), confidence)
-        return -(soft_targets * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
+        log_probs = F.log_softmax(logits, dim=1)
+        loss = -(soft_targets * log_probs).sum(dim=1)   # (batch,)
+
+        if self.weight is not None:
+            w = self.weight[targets]
+            loss = loss * w
+
+        return loss.mean()
 
 
 class BaselineSwinMER(nn.Module):
@@ -275,7 +303,7 @@ class BaselineSwinMER(nn.Module):
         feat_dim = self.backbone.num_features
         self.classifier = nn.Sequential(
             nn.LayerNorm(feat_dim),
-            nn.Dropout(p=0.3),
+            nn.Dropout(p=0.5),         # increased from 0.3
             nn.Linear(feat_dim, num_classes),
         )
 
@@ -329,9 +357,13 @@ def evaluate(model, loader, criterion, device) -> Tuple[float, float]:
     return total_loss / max(total, 1), correct / max(total, 1)
 
 
-def train(model, train_loader, val_loader, device, config, save_path) -> List[Dict]:
+def train(model, train_loader, val_loader, device, config, save_path,
+          class_weights=None) -> List[Dict]:
     epochs    = config["epochs"]
-    criterion = LabelSmoothingCrossEntropy(config["num_classes"], config["label_smoothing"])
+    patience  = config["early_stop_patience"]
+    criterion = WeightedLabelSmoothingCrossEntropy(
+        config["num_classes"], config["label_smoothing"], weight=class_weights
+    )
 
     optimizer = torch.optim.AdamW([
         {"params": model.backbone.parameters(),   "lr": config["lr"] * 0.1},
@@ -345,10 +377,10 @@ def train(model, train_loader, val_loader, device, config, save_path) -> List[Di
         progress = (epoch - warmup) / max(1, epochs - warmup)
         return 0.5 * (1.0 + np.cos(np.pi * progress))
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-    best_val_acc = 0.0
-    history      = []
+    scheduler  = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    best_val_acc   = 0.0
+    epochs_no_improv = 0
+    history    = []
 
     for epoch in range(1, epochs + 1):
         lr = optimizer.param_groups[1]["lr"]
@@ -363,18 +395,26 @@ def train(model, train_loader, val_loader, device, config, save_path) -> List[Di
             f"Epoch {epoch:03d}/{epochs} | lr={lr:.2e} | "
             f"train loss={train_loss:.4f} acc={train_acc:.3f} | "
             f"val loss={val_loss:.4f} acc={val_acc:.3f}"
-            + (" ← best" if is_best else "")
+            + (" <- best" if is_best else "")
         )
 
         if is_best:
-            best_val_acc = val_acc
+            best_val_acc     = val_acc
+            epochs_no_improv = 0
             torch.save({"epoch": epoch, "model": model.state_dict(),
                         "val_acc": val_acc, "config": config}, save_path)
+        else:
+            epochs_no_improv += 1
 
         history.append({"epoch": epoch, "lr": lr, "train_loss": train_loss,
                         "train_acc": train_acc, "val_loss": val_loss, "val_acc": val_acc})
 
-    print(f"\nBest val accuracy: {best_val_acc:.4f}  →  {save_path}")
+        # Early stopping
+        if epochs_no_improv >= patience:
+            print(f"  Early stopping triggered — no improvement for {patience} epochs.")
+            break
+
+    print(f"\nBest val accuracy: {best_val_acc:.4f}  ->  {save_path}")
     return history
 
 
@@ -397,7 +437,7 @@ def make_loaders(train_df, val_df, config, pin_memory):
 def run_loso(annotations, config, device, pin_memory) -> pd.DataFrame:
     subjects = sorted(annotations["subject"].unique())
     results  = []
-    print(f"Starting LOSO: {len(subjects)} subjects, {config['epochs']} epochs each")
+    print(f"Starting LOSO: {len(subjects)} subjects, up to {config['epochs']} epochs each")
     print("=" * 60)
 
     for i, subj in enumerate(subjects):
@@ -405,24 +445,22 @@ def run_loso(annotations, config, device, pin_memory) -> pd.DataFrame:
         val_df   = annotations[annotations["subject"] == subj]
         print(f"\n[{i+1}/{len(subjects)}] Held-out subject {subj} | "
               f"train={len(train_df)} val={len(val_df)}")
-
         if len(val_df) == 0:
-            print("  Skipped — no val samples.")
+            print("  Skipped.")
             continue
 
+        class_weights  = compute_class_weights(train_df, config["num_classes"], device)
         train_loader, val_loader = make_loaders(train_df, val_df, config, pin_memory)
-
-        model = BaselineSwinMER(config["num_classes"], config["pretrained"]).to(device)
+        model     = BaselineSwinMER(config["num_classes"], config["pretrained"]).to(device)
         save_path = config["save_path"].replace(".pth", f"_subj{subj}.pth")
 
-        history  = train(model, train_loader, val_loader, device, config, save_path)
+        history  = train(model, train_loader, val_loader, device, config, save_path, class_weights)
         best_acc = max(h["val_acc"] for h in history)
         best_ep  = max(history, key=lambda h: h["val_acc"])["epoch"]
 
         results.append({"subject": subj, "n_val": len(val_df),
                         "best_acc": best_acc, "best_epoch": best_ep,
                         "checkpoint": save_path})
-
         del model, train_loader, val_loader
         gc.collect()
         if device.type == "cuda":
@@ -432,9 +470,67 @@ def run_loso(annotations, config, device, pin_memory) -> pd.DataFrame:
     print("\n" + "=" * 60)
     print("LOSO SUMMARY")
     print(df.to_string(index=False))
-    print(f"\nMean accuracy: {df['best_acc'].mean():.4f} ± {df['best_acc'].std():.4f}")
+    print(f"\nMean accuracy: {df['best_acc'].mean():.4f} +/- {df['best_acc'].std():.4f}")
     df.to_csv("loso_results.csv", index=False)
-    print("Results saved → loso_results.csv")
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# K-FOLD
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_kfold(annotations, config, device, pin_memory, k: int = 10) -> pd.DataFrame:
+    """Subject-grouped k-fold CV — no subject appears in both train and val."""
+    subjects = np.array(sorted(annotations["subject"].unique()))
+    rng      = np.random.default_rng(config["seed"])
+    folds    = np.array_split(rng.permutation(subjects), k)
+
+    results = []
+    print(f"Starting {k}-Fold CV: {len(subjects)} subjects, "
+          f"up to {config['epochs']} epochs per fold (early stop patience={config['early_stop_patience']})")
+    print("=" * 60)
+
+    for fold_idx, val_subjects in enumerate(folds):
+        train_subjects = np.concatenate([folds[j] for j in range(k) if j != fold_idx])
+        train_df = annotations[annotations["subject"].isin(train_subjects)]
+        val_df   = annotations[annotations["subject"].isin(val_subjects)]
+
+        print(f"\n[Fold {fold_idx+1}/{k}] "
+              f"val subjects={sorted(val_subjects.tolist())} | "
+              f"train={len(train_df)} val={len(val_df)}")
+        if len(val_df) == 0:
+            print("  Skipped.")
+            continue
+
+        class_weights  = compute_class_weights(train_df, config["num_classes"], device)
+        train_loader, val_loader = make_loaders(train_df, val_df, config, pin_memory)
+        model     = BaselineSwinMER(config["num_classes"], config["pretrained"]).to(device)
+        save_path = config["save_path"].replace(".pth", f"_fold{fold_idx+1}.pth")
+
+        history  = train(model, train_loader, val_loader, device, config, save_path, class_weights)
+        best_acc = max(h["val_acc"] for h in history)
+        best_ep  = max(history, key=lambda h: h["val_acc"])["epoch"]
+
+        results.append({
+            "fold":       fold_idx + 1,
+            "n_train":    len(train_df),
+            "n_val":      len(val_df),
+            "best_acc":   best_acc,
+            "best_epoch": best_ep,
+            "checkpoint": save_path,
+        })
+        del model, train_loader, val_loader
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    df = pd.DataFrame(results)
+    print("\n" + "=" * 60)
+    print(f"{k}-FOLD CV SUMMARY")
+    print(df[["fold", "n_train", "n_val", "best_acc", "best_epoch"]].to_string(index=False))
+    print(f"\nMean accuracy: {df['best_acc'].mean():.4f} +/- {df['best_acc'].std():.4f}")
+    df.to_csv(f"kfold{k}_results.csv", index=False)
+    print(f"Results saved -> kfold{k}_results.csv")
     return df
 
 
@@ -443,7 +539,7 @@ def run_loso(annotations, config, device, pin_memory) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Baseline MER — 6ch Swin Transformer")
+    p = argparse.ArgumentParser(description="Baseline MER -- 6ch Swin Transformer")
     p.add_argument("--data-root",        default=CONFIG["data_root"])
     p.add_argument("--epochs",           type=int,   default=CONFIG["epochs"])
     p.add_argument("--batch-size",       type=int,   default=CONFIG["batch_size"])
@@ -452,14 +548,17 @@ def parse_args():
     p.add_argument("--lr",               type=float, default=CONFIG["lr"])
     p.add_argument("--seed",             type=int,   default=CONFIG["seed"])
     p.add_argument("--no-loso",          action="store_true",
-                   help="Single fold only (first subject held out), for a quick sanity check")
+                   help="Single fold only (first subject held out)")
+    p.add_argument("--kfold",            type=int,   default=None,
+                   help="Run subject-grouped k-fold CV (e.g. --kfold 10)")
+    p.add_argument("--all-data",         action="store_true",
+                   help="Use all available clips — disables sample_per_class cap")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
 
-    # Merge CLI args into config
     config = {**CONFIG,
               "data_root":        args.data_root,
               "epochs":           args.epochs,
@@ -476,21 +575,29 @@ if __name__ == "__main__":
     pin_memory = (device.type == "cuda")
     print(f"Device: {device}")
 
-    # Load & sample data
-    all_clips   = load_casme_processed(config["data_root"])
-    annotations = sample_clips(all_clips, config["sample_per_class"], config["seed"])
+    all_clips = load_casme_processed(config["data_root"])
+
+    if args.all_data:
+        print("Using ALL available clips (no sampling cap)")
+        annotations = all_clips.copy()
+    else:
+        annotations = sample_clips(all_clips, config["sample_per_class"], config["seed"])
+
     save_sample_log(annotations, config["sample_log_path"])
 
     if args.no_loso:
-        # Single fold: first subject held out
-        subjects    = sorted(annotations["subject"].unique())
-        held_out    = subjects[0]
-        train_df    = annotations[annotations["subject"] != held_out]
-        val_df      = annotations[annotations["subject"] == held_out]
-        print(f"\nSingle fold — held-out: {held_out} | train={len(train_df)} val={len(val_df)}")
-
+        subjects = sorted(annotations["subject"].unique())
+        held_out = subjects[0]
+        train_df = annotations[annotations["subject"] != held_out]
+        val_df   = annotations[annotations["subject"] == held_out]
+        print(f"\nSingle fold -- held-out: {held_out} | train={len(train_df)} val={len(val_df)}")
+        class_weights  = compute_class_weights(train_df, config["num_classes"], device)
         train_loader, val_loader = make_loaders(train_df, val_df, config, pin_memory)
         model = BaselineSwinMER(config["num_classes"], config["pretrained"]).to(device)
-        train(model, train_loader, val_loader, device, config, config["save_path"])
+        train(model, train_loader, val_loader, device, config, config["save_path"], class_weights)
+
+    elif args.kfold is not None:
+        run_kfold(annotations, config, device, pin_memory, k=args.kfold)
+
     else:
         run_loso(annotations, config, device, pin_memory)

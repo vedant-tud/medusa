@@ -3,5 +3,14 @@ numpy
 opencv-python
 scipy
 setproctitle
-tensorflow
 tqdm
+# deep learning
+torch
+torchvision
+timm
+scikit-image
+pandas
+# backend
+fastapi
+uvicorn[standard]
+python-multipart
