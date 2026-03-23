@@ -12,6 +12,12 @@ import torch.nn.functional as F
 from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 from tqdm import tqdm
 
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__), 'motion_amp'))
+from magnet import MagNet
+from callbacks import gen_state_dict
+from data import unit_postprocessing, unit_preprocessing
+
 def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -47,7 +53,7 @@ def prepare_for_raft(img_np):
     img_t = 2.0 * (img_t / 255.0) - 1.0
     return img_t
 
-def process_video_clip(model, clip_path, out_clip_path):
+def process_video_clip(model, magnet_model, clip_path, out_clip_path, amp_factor=10):
     onset_path = os.path.join(clip_path, "onset.jpg")
     apex_path  = os.path.join(clip_path, "apex.jpg")
 
@@ -67,18 +73,38 @@ def process_video_clip(model, clip_path, out_clip_path):
     onset_crop = align_and_crop_face(onset_rgb)
     apex_crop  = align_and_crop_face(apex_rgb)
 
+    # Convert to format required for MagNet
+    onset_mag_input = torch.from_numpy(onset_crop).permute(2, 0, 1).float().unsqueeze(0).to(device) / 127.5 - 1.0 # (1, 3, H, W), -1 to 1
+    apex_mag_input  = torch.from_numpy(apex_crop).permute(2, 0, 1).float().unsqueeze(0).to(device) / 127.5 - 1.0
+    
     # Flipped versions matching standard horizontal augmentation probability mapping
     onset_crop_flip = cv2.flip(onset_crop, 1)
     apex_crop_flip  = cv2.flip(apex_crop,  1)
 
+    onset_mag_flip_input = torch.from_numpy(onset_crop_flip).permute(2, 0, 1).float().unsqueeze(0).to(device) / 127.5 - 1.0
+    apex_mag_flip_input  = torch.from_numpy(apex_crop_flip).permute(2, 0, 1).float().unsqueeze(0).to(device) / 127.5 - 1.0
+
     with torch.no_grad():
-        # NORMAL FLOW
-        flow_predictions = model(prepare_for_raft(onset_crop), prepare_for_raft(apex_crop))
+        # APPLY MAGNET
+        amp_tensor = torch.tensor([amp_factor], device=device, dtype=torch.float32)
+        while len(amp_tensor.shape) < len(onset_mag_input.shape):
+            amp_tensor = amp_tensor.unsqueeze(-1)
+            
+        # MagNet expects mode='evaluate' and returns a tuple, first is amplified frame
+        amplified_apex = magnet_model(onset_mag_input, apex_mag_input, 0, 0, amp_tensor, mode='evaluate')[0]
+        amplified_apex_flip = magnet_model(onset_mag_flip_input, apex_mag_flip_input, 0, 0, amp_tensor, mode='evaluate')[0]
+        
+        # Convert back to uint8 RGB (0-255) to be prepared for RAFT
+        amplified_apex_np = torch.clamp((amplified_apex.squeeze(0).permute(1, 2, 0) + 1.0) * 127.5, 0, 255).byte().cpu().numpy()
+        amplified_apex_flip_np = torch.clamp((amplified_apex_flip.squeeze(0).permute(1, 2, 0) + 1.0) * 127.5, 0, 255).byte().cpu().numpy()
+
+        # NORMAL FLOW (onset -> amplified apex)
+        flow_predictions = model(prepare_for_raft(onset_crop), prepare_for_raft(amplified_apex_np))
         # raft outputs a list of refined flow estimates, last is highest accuracy
         flow = flow_predictions[-1][0].cpu().numpy() # Shape (2, H, W)
 
         # FLIPPED FLOW
-        flow_predictions_flip = model(prepare_for_raft(onset_crop_flip), prepare_for_raft(apex_crop_flip))
+        flow_predictions_flip = model(prepare_for_raft(onset_crop_flip), prepare_for_raft(amplified_apex_flip_np))
         flow_flip = flow_predictions_flip[-1][0].cpu().numpy()
 
     # Create matching Grayscales
@@ -104,9 +130,17 @@ def main():
     weights = Raft_Large_Weights.DEFAULT
     model = raft_large(weights=weights, progress=True).to(device)
     model.eval()
+    amp_factor = 10
+    # Load MagNet model
+    magnet_model = MagNet().to(device)
+    magnet_weights_path = os.path.join(os.path.dirname(__file__), 'motion_amp', 'magnet_epoch12_loss7.28e-02.pth')
+    state_dict = gen_state_dict(magnet_weights_path)
+    magnet_model.load_state_dict(state_dict)
+    magnet_model.eval()
+    print("Loaded MagNet weights successfully")
 
     data_root = "./casme_processed"
-    output_root = "./casme_raft_processed"
+    output_root = "./casme_raft_processed"+str(amp_factor)
     if not os.path.isdir(data_root):
         print(f"Data root not found: {data_root}")
         return
@@ -125,7 +159,7 @@ def main():
     failed_clips = []
     success_count = 0
     for in_path, out_path in tqdm(clip_paths, desc="Generating RAFT pairs"):
-        if process_video_clip(model, in_path, out_path):
+        if process_video_clip(model, magnet_model, in_path, out_path, amp_factor=amp_factor):
             success_count += 1
         else:
             failed_clips.append(in_path)
