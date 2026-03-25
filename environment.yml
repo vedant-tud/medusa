@@ -1,0 +1,22 @@
+name: medusa
+channels:
+  - pytorch
+  - nvidia
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.11.9
+  - pip
+  - numpy
+  - scipy
+  - pandas
+  - tqdm
+  - pytorch>=2.0.0
+  - torchvision
+  - pytorch-cuda=12.1
+  - pip:
+      - opencv-python
+      - timm>=0.6.0
+      - configobj
+      - setproctitle
+      - tensorflow

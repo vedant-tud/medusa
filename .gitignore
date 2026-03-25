@@ -2,6 +2,7 @@ data/*
 casme_processed/
 *desktop.ini
 .venv/
+.venv_medusa/
 __pycache__/
 *.zip
 .env
@@ -11,3 +12,6 @@ __pycache__/
 ./quick_test.pth
 ./sample_log.csv
 ./baseline_mer.ipynb
+casme_processed/*
+casme_raft_processed*/*
+.cache/*
