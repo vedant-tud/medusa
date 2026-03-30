@@ -15,3 +15,5 @@ __pycache__/
 casme_processed/*
 casme_raft_processed*/*
 .cache/*
+saved_dual_cnn/*
+
