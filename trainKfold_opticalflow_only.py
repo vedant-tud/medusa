@@ -19,7 +19,7 @@ import gc
 import argparse
 import warnings
 warnings.filterwarnings("ignore")
-
+from sklearn.metrics import recall_score, f1_score
 import numpy as np
 import pandas as pd
 import cv2
@@ -43,8 +43,8 @@ from typing import Optional, List, Dict, Tuple
 
 CONFIG = {
     "data_root":        "./casme_raft_processed10",
-    "sample_log_path":  "./save_exp_1/sample_log.csv",
-    "num_classes":      7,
+    "sample_log_path":  "./save_focal_loss/focal_loss_log.csv",
+    "num_classes":      3,
     "image_size":       256,      # <--- CHANGE THIS FROM 224 TO 256
     "pretrained":       True,
     "sample_per_class": 100,      
@@ -58,17 +58,22 @@ CONFIG = {
     "warmup_epochs":    5,
     "seed":             42,
     "num_workers":      4,
-    "save_path":        "./save_exp_1/best_baseline.pth",
+    "save_path":        "./save_focal_loss/best_focal_loss.pth",
+}
+
+TARGET_CLASSES = {
+    "happiness": "positive",
+    "disgust": "negative",
+    "anger": "negative",
+    "fear": "negative",
+    "sadness": "negative",
+    "surprise": "surprise"
 }
 
 LABEL_MAP = {
-    "happiness":  0,
-    "disgust":    1,
-    "surprise":   2,
-    "anger":      3,
-    "fear":       4,
-    "sadness":    5,
-    "others":     6,
+    "positive":  0,
+    "negative":  1,
+    "surprise":  2,
 }
 ID_TO_LABEL = {v: k for k, v in LABEL_MAP.items()}
 
@@ -143,7 +148,13 @@ def load_casme_processed(data_root: str) -> pd.DataFrame:
             if info is None:
                 continue
 
-            emotion_id = LABEL_MAP.get(info["emotion"], LABEL_MAP.get("others", 6))
+            raw_emotion = info["emotion"]
+            if raw_emotion not in TARGET_CLASSES:
+                continue
+
+            emotion = TARGET_CLASSES[raw_emotion]
+            emotion_id = LABEL_MAP[emotion]
+
             records.append({
                 "subject":     info["subject"],
                 "clip_folder": clip_path,
@@ -151,8 +162,9 @@ def load_casme_processed(data_root: str) -> pd.DataFrame:
                 "flow_npy":    flow_npy,
                 "onset_gray_flip": onset_gray_flip,
                 "flow_flip_npy": flow_flip_npy,
-                "emotion":     info["emotion"],
+                "emotion":     emotion,
                 "emotion_id":  emotion_id,
+                "raw_emotion": raw_emotion
             })
 
     df = pd.DataFrame(records)
@@ -174,6 +186,8 @@ def sample_clips(df: pd.DataFrame, n_per_class: int, seed: int = 42) -> pd.DataF
 
 
 def save_sample_log(df: pd.DataFrame, path: str) -> None:
+    # if os.dirname(path) and not os.path.isdir(os.path.dirname(path)):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     df[["clip_folder", "subject", "emotion", "emotion_id"]].to_csv(path, index=False)
     print(f"Sample log saved → {path}  ({len(df)} rows)")
 
@@ -293,31 +307,42 @@ class CasmeBaselineDataset(Dataset):
 
         if use_flip:
             flow_path  = row["flow_flip_npy"]
+            gray_path  = row["onset_gray_flip"]
         else:
             flow_path  = row["flow_npy"]
+            gray_path  = row["onset_gray"]
 
-        # 1. Load flow (2, H, W)
+        # --- STREAM 1: OPTICAL FLOW ---
         try:
             flow = np.load(flow_path).astype(np.float32) 
         except:
-            # Fallback to zero motion if file is missing/corrupted
             flow = np.zeros((2, self.size, self.size), dtype=np.float32)
 
-        # 2. Resize if dimensions don't match (RAFT usually outputs exact sizes, but safety first)
         if flow.shape[1] != self.size or flow.shape[2] != self.size:
-            # Transpose to (H,W,C) for cv2, resize, then back to (C,H,W)
             flow = flow.transpose(1, 2, 0)
             flow = cv2.resize(flow, (self.size, self.size))
             flow = flow.transpose(2, 0, 1)
 
-        # 3. Convert Flow to RGB Heatmap (Geometry-Only Input)
         rgb_heatmap = flow_to_rgb_heatmap(flow)
+        tensor_flow = self.transform(torch.from_numpy(rgb_heatmap))
 
-        # 4. Apply PyTorch Transforms
-        tensor_data = torch.from_numpy(rgb_heatmap)
-        tensor_data = self.transform(tensor_data)
+        # --- STREAM 2: SPATIAL STRUCTURE ---
+        gray_img = cv2.imread(gray_path, cv2.IMREAD_GRAYSCALE)
+        if gray_img is None:
+            gray_img = np.zeros((self.size, self.size), dtype=np.float32)
+        else:
+            gray_img = cv2.resize(gray_img, (self.size, self.size))
+            gray_img = gray_img.astype(np.float32) / 255.0
 
-        return tensor_data, label
+        # Convert to (1, H, W) tensor
+        tensor_gray = torch.from_numpy(gray_img).unsqueeze(0)
+        # Apply standard ImageNet normalization to the single channel
+        tensor_gray = transforms.Normalize([0.5], [0.5])(tensor_gray)
+
+        # Return a tuple of the two inputs, plus the label
+        return (tensor_flow, tensor_gray), label
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MODEL
 # ─────────────────────────────────────────────────────────────────────────────
@@ -344,30 +369,67 @@ class WeightedLabelSmoothingCrossEntropy(nn.Module):
             loss = loss * w
 
         return loss.mean()
+class WeightedFocalLoss(nn.Module):
+    """
+    Focal Loss with per-class weights.
+    Forces the model to ignore 'easy' majority classes and focus on 'hard' minority classes.
+    """
+    def __init__(self, weight: Optional[torch.Tensor] = None, gamma: float = 2.0):
+        super().__init__()
+        self.weight = weight # shape: (num_classes,)
+        self.gamma = gamma
 
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce_loss = F.cross_entropy(logits, targets, reduction='none', weight=self.weight)
+        pt = torch.exp(-ce_loss) # Probability of the true class
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        
+        return focal_loss.mean()
 # ─────────────────────────────────────────────────────────────────────────────
 # MODEL
 # ─────────────────────────────────────────────────────────────────────────────
 
-class BaselineSwinMER(nn.Module):
+class DualStreamMER(nn.Module):
     def __init__(self, num_classes: int = 7, pretrained: bool = True):
         super().__init__()
-        # 1. Use the new Swin-v2 256x256 model string
-        self.backbone = timm.create_model(
+        
+        # --- Stream 1: Motion Branch (Swin-v2) ---
+        self.stream_motion = timm.create_model(
             "swinv2_tiny_window8_256", 
             pretrained=pretrained,
-            num_classes=0,
+            num_classes=0, 
         )
+        feat_dim_motion = self.stream_motion.num_features # Usually 768
         
-        feat_dim = self.backbone.num_features
+        # --- Stream 2: Spatial Branch (ResNet-18) ---
+        # Note: in_chans=1 tells timm to modify the first conv layer for grayscale
+        self.stream_spatial = timm.create_model(
+            "resnet18", 
+            pretrained=pretrained,
+            num_classes=0,
+            in_chans=1 
+        )
+        feat_dim_spatial = self.stream_spatial.num_features # Usually 512
+
+        # --- Fusion & Classification ---
+        total_feat_dim = feat_dim_motion + feat_dim_spatial # 768 + 512 = 1280
+        
         self.classifier = nn.Sequential(
-            nn.LayerNorm(feat_dim),
+            nn.LayerNorm(total_feat_dim),
             nn.Dropout(p=0.5),         
-            nn.Linear(feat_dim, num_classes),
+            nn.Linear(total_feat_dim, num_classes),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.classifier(self.backbone(x))
+    def forward(self, flow_x: torch.Tensor, gray_x: torch.Tensor) -> torch.Tensor:
+        # Pass inputs through their respective branches
+        f_motion = self.stream_motion(flow_x)
+        f_spatial = self.stream_spatial(gray_x)
+        
+        # Concatenate the features along the channel dimension
+        f_fused = torch.cat((f_motion, f_spatial), dim=1)
+        
+        # Classify the fused features
+        return self.classifier(f_fused)
 # ─────────────────────────────────────────────────────────────────────────────
 # TRAINING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -375,45 +437,78 @@ class BaselineSwinMER(nn.Module):
 def train_one_epoch(model, loader, optimizer, criterion, device, grad_clip) -> Tuple[float, float]:
     model.train()
     total_loss, correct, total = 0.0, 0, 0
-    for x, y in tqdm(loader, desc="  train", leave=False):
-        x, y = x.to(device), y.to(device)
-        logits = model(x)
+    
+    # UNPACK THE TUPLE HERE
+    for (x_flow, x_gray), y in tqdm(loader, desc="  train", leave=False):
+        x_flow = x_flow.to(device)
+        x_gray = x_gray.to(device)
+        y = y.to(device)
+        
+        # PASS BOTH TO THE MODEL
+        logits = model(x_flow, x_gray)
         loss   = criterion(logits, y)
+        
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
+        
         total_loss += loss.item() * y.size(0)
         correct    += (logits.argmax(1) == y).sum().item()
         total      += y.size(0)
+        
     return total_loss / max(total, 1), correct / max(total, 1)
-
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device) -> Tuple[float, float]:
+def evaluate(model, loader, criterion, device) -> Tuple[float, float, float, float]:
     model.eval()
-    total_loss, correct, total = 0.0, 0, 0
-    for x, y in tqdm(loader, desc="  eval ", leave=False):
-        x, y   = x.to(device), y.to(device)
-        logits = model(x)
+    total_loss = 0.0
+    
+    all_preds = []
+    all_targets = []
+    
+    for (x_flow, x_gray), y in tqdm(loader, desc="  eval ", leave=False):
+        x_flow = x_flow.to(device)
+        x_gray = x_gray.to(device)
+        y = y.to(device)
+        
+        logits = model(x_flow, x_gray)
         loss   = criterion(logits, y)
         total_loss += loss.item() * y.size(0)
-        correct    += (logits.argmax(1) == y).sum().item()
-        total      += y.size(0)
-    return total_loss / max(total, 1), correct / max(total, 1)
+        
+        preds = logits.argmax(1)
+        
+        # Store for scikit-learn metrics
+        all_preds.extend(preds.cpu().numpy())
+        all_targets.extend(y.cpu().numpy())
+        
+    avg_loss = total_loss / max(len(all_targets), 1)
+    
+    # Calculate Standard Accuracy
+    acc = np.mean(np.array(all_preds) == np.array(all_targets))
+    
+    # Calculate UAR (Unweighted Average Recall)
+    uar = recall_score(all_targets, all_preds, average='macro', zero_division=0)
+    
+    # Calculate UF1 (Unweighted F1-Score)
+    uf1 = f1_score(all_targets, all_preds, average='macro', zero_division=0)
+    
+    return avg_loss, acc, uar, uf1
 
 
 def train(model, train_loader, val_loader, device, config, save_path,
           class_weights=None) -> List[Dict]:
     epochs    = config["epochs"]
     patience  = config["early_stop_patience"]
-    criterion = WeightedLabelSmoothingCrossEntropy(
-        config["num_classes"], config["label_smoothing"], weight=class_weights
-    )
+    # criterion = WeightedLabelSmoothingCrossEntropy(
+    #     config["num_classes"], config["label_smoothing"], weight=class_weights
+    # )
+    criterion = WeightedFocalLoss(weight=class_weights)  # <--- SWITCH TO FOCAL LOSS FOR BETTER IMBALANCE HANDLING
 
     optimizer = torch.optim.AdamW([
-        {"params": model.backbone.parameters(),   "lr": config["lr"] * 0.1},
-        {"params": model.classifier.parameters(), "lr": config["lr"]},
+        {"params": model.stream_motion.parameters(),  "lr": config["lr"] * 0.1},
+        {"params": model.stream_spatial.parameters(), "lr": config["lr"] * 0.1},
+        {"params": model.classifier.parameters(),     "lr": config["lr"]},
     ], weight_decay=config["weight_decay"])
 
     warmup = config["warmup_epochs"]
@@ -433,27 +528,37 @@ def train(model, train_loader, val_loader, device, config, save_path,
         train_loss, train_acc = train_one_epoch(
             model, train_loader, optimizer, criterion, device, config["grad_clip"]
         )
-        val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+        # Change how you call evaluate:
+        val_loss, val_acc, val_uar, val_uf1 = evaluate(model, val_loader, criterion, device)
         scheduler.step()
 
-        is_best = val_acc > best_val_acc
+        # Update the best score logic to use UAR instead of raw accuracy
+        is_best = val_uar > best_val_acc # Using UAR as the new benchmark for 'best'
+        
         print(
             f"Epoch {epoch:03d}/{epochs} | lr={lr:.2e} | "
             f"train loss={train_loss:.4f} acc={train_acc:.3f} | "
-            f"val loss={val_loss:.4f} acc={val_acc:.3f}"
+            f"val loss={val_loss:.4f} acc={val_acc:.3f} UAR={val_uar:.3f} UF1={val_uf1:.3f}"
             + (" <- best" if is_best else "")
         )
 
         if is_best:
-            best_val_acc     = val_acc
+            best_val_acc = val_uar # Tracking highest UAR
             epochs_no_improv = 0
+            
+            # --- ADD THIS LINE ---
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            
             torch.save({"epoch": epoch, "model": model.state_dict(),
                         "val_acc": val_acc, "config": config}, save_path)
         else:
             epochs_no_improv += 1
 
-        history.append({"epoch": epoch, "lr": lr, "train_loss": train_loss,
-                        "train_acc": train_acc, "val_loss": val_loss, "val_acc": val_acc})
+        history.append({
+            "epoch": epoch, "lr": lr, "train_loss": train_loss,
+            "train_acc": train_acc, "val_loss": val_loss, "val_acc": val_acc,
+            "val_uar": val_uar, "val_uf1": val_uf1  # <--- MUST TRACK THESE
+        })
 
         # Early stopping
         if epochs_no_improv >= patience:
@@ -497,7 +602,7 @@ def run_loso(annotations, config, device, pin_memory) -> pd.DataFrame:
 
         class_weights  = compute_class_weights(train_df, config["num_classes"], device)
         train_loader, val_loader = make_loaders(train_df, val_df, config, pin_memory)
-        model     = BaselineSwinMER(config["num_classes"], config["pretrained"]).to(device)
+        model     = DualStreamMER(config["num_classes"], config["pretrained"]).to(device)
         save_path = config["save_path"].replace(".pth", f"_subj{subj}.pth")
 
         history  = train(model, train_loader, val_loader, device, config, save_path, class_weights)
@@ -550,18 +655,28 @@ def run_kfold(annotations, config, device, pin_memory, k: int = 10) -> pd.DataFr
 
         class_weights  = compute_class_weights(train_df, config["num_classes"], device)
         train_loader, val_loader = make_loaders(train_df, val_df, config, pin_memory)
-        model     = BaselineSwinMER(config["num_classes"], config["pretrained"]).to(device)
+        model     = DualStreamMER(config["num_classes"], config["pretrained"]).to(device)
         save_path = config["save_path"].replace(".pth", f"_fold{fold_idx+1}.pth")
 
         history  = train(model, train_loader, val_loader, device, config, save_path, class_weights)
-        best_acc = max(h["val_acc"] for h in history)
-        best_ep  = max(history, key=lambda h: h["val_acc"])["epoch"]
+        
+        # Pull the best scores based on UAR/UF1, not raw accuracy
+        best_uar = max(h["val_uar"] for h in history)
+        best_uf1 = max(h["val_uf1"] for h in history)
+        
+        # Find the epoch that produced the best UAR
+        best_ep  = max(history, key=lambda h: h["val_uar"])["epoch"]
+        
+        # Get the raw accuracy for that specific best epoch
+        best_acc_for_ep = next(h["val_acc"] for h in history if h["epoch"] == best_ep)
 
         results.append({
             "fold":       fold_idx + 1,
             "n_train":    len(train_df),
             "n_val":      len(val_df),
-            "best_acc":   best_acc,
+            "best_acc":   best_acc_for_ep,
+            "best_uar":   best_uar,
+            "best_uf1":   best_uf1,
             "best_epoch": best_ep,
             "checkpoint": save_path,
         })
@@ -571,10 +686,12 @@ def run_kfold(annotations, config, device, pin_memory, k: int = 10) -> pd.DataFr
             torch.cuda.empty_cache()
 
     df = pd.DataFrame(results)
+    df = pd.DataFrame(results)
     print("\n" + "=" * 60)
     print(f"{k}-FOLD CV SUMMARY")
-    print(df[["fold", "n_train", "n_val", "best_acc", "best_epoch"]].to_string(index=False))
-    print(f"\nMean accuracy: {df['best_acc'].mean():.4f} +/- {df['best_acc'].std():.4f}")
+    print(df[["fold", "n_train", "n_val", "best_acc", "best_uar", "best_uf1", "best_epoch"]].to_string(index=False))
+    print(f"\nMean UF1: {df['best_uf1'].mean():.4f} +/- {df['best_uf1'].std():.4f}")
+    print(f"Mean UAR: {df['best_uar'].mean():.4f} +/- {df['best_uar'].std():.4f}")
     df.to_csv(f"kfold{k}_results.csv", index=False)
     print(f"Results saved -> kfold{k}_results.csv")
     return df
@@ -639,7 +756,7 @@ if __name__ == "__main__":
         print(f"\nSingle fold -- held-out: {held_out} | train={len(train_df)} val={len(val_df)}")
         class_weights  = compute_class_weights(train_df, config["num_classes"], device)
         train_loader, val_loader = make_loaders(train_df, val_df, config, pin_memory)
-        model = BaselineSwinMER(config["num_classes"], config["pretrained"]).to(device)
+        model = DualStreamMER(config["num_classes"], config["pretrained"]).to(device)
         train(model, train_loader, val_loader, device, config, config["save_path"], class_weights)
 
     elif args.kfold is not None:
