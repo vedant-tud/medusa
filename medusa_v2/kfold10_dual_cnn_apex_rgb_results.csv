@@ -1,0 +1,11 @@
+fold,best_acc,best_uar,best_uf1,best_epoch,saved_model
+1,0.6943620178041543,0.4635560532537016,0.4079510075170594,76,./save_dual_cnn/best_scl_dual_cnn_fold1_apex_rgb.pth
+2,0.6183431952662722,0.40158730158730155,0.42142812329147733,24,./save_dual_cnn/best_scl_dual_cnn_fold2_apex_rgb.pth
+3,0.7896253602305475,0.4525408726439654,0.43799187656587685,17,./save_dual_cnn/best_scl_dual_cnn_fold3_apex_rgb.pth
+4,0.6534446764091858,0.44084984904193947,0.384646694094599,3,./save_dual_cnn/best_scl_dual_cnn_fold4_apex_rgb.pth
+5,0.6806083650190115,0.3552601809954751,0.3507556606148155,21,./save_dual_cnn/best_scl_dual_cnn_fold5_apex_rgb.pth
+6,0.6325301204819277,0.5413074712643678,0.4036166384933195,26,./save_dual_cnn/best_scl_dual_cnn_fold6_apex_rgb.pth
+7,0.7552870090634441,0.344656699889258,0.32693840579710143,25,./save_dual_cnn/best_scl_dual_cnn_fold7_apex_rgb.pth
+8,0.7134986225895317,0.538625172838811,0.3684442632210845,43,./save_dual_cnn/best_scl_dual_cnn_fold8_apex_rgb.pth
+9,0.53125,0.39029451137884874,0.3781641320456331,37,./save_dual_cnn/best_scl_dual_cnn_fold9_apex_rgb.pth
+10,0.11428571428571428,0.4119981325863679,0.13062750631811404,1,./save_dual_cnn/best_scl_dual_cnn_fold10_apex_rgb.pth
