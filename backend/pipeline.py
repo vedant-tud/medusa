@@ -336,8 +336,14 @@ def run_inference(model: DualCnnMER, flow: np.ndarray,
     tensor_spatial  = torch.from_numpy(apex_resized).permute(2, 0, 1).float() / 255.0
     tensor_spatial  = (tensor_spatial - 0.5) / 0.5
 
-    logits  = model(tensor_flow.unsqueeze(0).to(device),
-                    tensor_spatial.unsqueeze(0).to(device))
+    # AdaptiveAvgPool2d on MPS requires input divisible by output size (unimplemented).
+    # DualCnnMER is tiny so CPU fallback has negligible cost.
+    if device.type == "mps":
+        model.to("cpu")
+        logits = model(tensor_flow.unsqueeze(0), tensor_spatial.unsqueeze(0))
+        model.to(device)
+    else:
+        logits = model(tensor_flow.unsqueeze(0).to(device), tensor_spatial.unsqueeze(0).to(device))
     probs   = F.softmax(logits, dim=1).squeeze(0).cpu().tolist()
     pred_id = int(np.argmax(probs))
 
@@ -352,84 +358,118 @@ def run_inference(model: DualCnnMER, flow: np.ndarray,
 
 # ── Main pipeline ────────────────────────────────────────────────────────────
 
-def _log(step: int, total: int, msg: str) -> None:
-    print(f"  [{step}/{total}] {msg}", flush=True)
+PIPELINE_STEPS = [
+    "Loading frames",
+    "Apex frame detection",
+    "Onset frame detection",
+    "Face detection & crop",
+    "MagNet amplification",
+    "RAFT optical flow",
+    "Running inference",
+]
+
+
+def process_video_stream(video_path: str, model: DualCnnMER, raft_model,
+                         magnet_model, device: torch.device,
+                         onset_window_size: int = 15):
+    """
+    Generator — yields progress dicts at each step, then a final result dict.
+
+    Progress event:  {"step": int, "total": int, "label": str}
+    Result event:    {"done": True, **result_fields}
+    Error event:     {"error": str}
+    """
+    TOTAL = len(PIPELINE_STEPS)
+    print("\n── Pipeline started ─────────────────────────────", flush=True)
+
+    def progress(step: int, extra: str = ""):
+        label = PIPELINE_STEPS[step - 1]
+        print(f"  [{step}/{TOTAL}] {label}{(' — ' + extra) if extra else ''}…", flush=True)
+        return {"step": step, "total": TOTAL, "label": label}
+
+    try:
+        # 1. Load frames
+        yield progress(1)
+        cap    = cv2.VideoCapture(video_path)
+        fps    = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        cap.release()
+        if len(frames) == 0:
+            yield {"error": "Could not read any frames from the video."}
+            return
+        print(f"      → {len(frames)} frames at {fps:.1f} fps", flush=True)
+
+        # 2. Apex detection
+        yield progress(2)
+        spotter  = ApexFrameSpotter(t_window=min(61, len(frames)))
+        apex_idx, apex_score, _ = spotter.find_apex_in_short_video(frames)
+        print(f"      → apex frame: {apex_idx}  (score={apex_score:.2f})", flush=True)
+
+        # 3. Onset detection
+        yield progress(3, f"window={onset_window_size}")
+        onset_idx = detect_onset_frame(frames, apex_idx, window_size=onset_window_size)
+        print(f"      → onset frame: {onset_idx}", flush=True)
+
+        onset_raw = frames[onset_idx]
+        apex_raw  = frames[apex_idx]
+
+        # 4. Face crop
+        yield progress(4)
+        onset_crop = align_and_crop_face(onset_raw, target_size=224)
+        apex_crop  = align_and_crop_face(apex_raw,  target_size=224)
+
+        # 5. MagNet amplification
+        yield progress(5)
+        apex_amplified = apply_magnet(onset_crop, apex_crop, magnet_model, device)
+
+        # 6. RAFT flow
+        yield progress(6)
+        flow     = compute_raft_flow(onset_crop, apex_amplified, raft_model, device)
+        flow_vis = flow_to_vis(flow)
+        print(f"      → flow shape: {flow.shape}", flush=True)
+
+        # 7. Inference
+        yield progress(7)
+        result = run_inference(model, flow, apex_crop, device)
+        print(f"      → {result['emotion']}  conf={result['confidence']:.3f}", flush=True)
+
+        result.update({
+            "apex_frame_index":  int(apex_idx),
+            "onset_frame_index": int(onset_idx),
+            "total_frames":      len(frames),
+            "fps":               round(fps, 2),
+            "images": {
+                "onset":        encode_b64(onset_raw),
+                "apex":         encode_b64(apex_raw),
+                "onset_face":   encode_b64(onset_crop),
+                "apex_face":    encode_b64(apex_crop),
+                "magnified":    encode_b64(apex_amplified),
+                "optical_flow": encode_b64(flow_vis),
+            },
+        })
+
+        print("── Pipeline complete ────────────────────────────\n", flush=True)
+        yield {"done": True, **result}
+
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        yield {"error": str(exc)}
 
 
 def process_video(video_path: str, model: DualCnnMER, raft_model,
                   magnet_model, device: torch.device,
                   onset_window_size: int = 15) -> dict:
-    """
-    Full pipeline: video file → dict with results and base64 images.
-    onset_window_size: sliding-window size for onset detection (default 15 ≈ 0.5 s at 30 fps).
-    """
-    TOTAL = 7
-    print("\n── Pipeline started ─────────────────────────────", flush=True)
-
-    # 1. Load frames
-    _log(1, TOTAL, "Loading frames from video…")
-    cap    = cv2.VideoCapture(video_path)
-    fps    = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    frames = []
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    cap.release()
-
-    if len(frames) == 0:
-        raise ValueError("Could not read any frames from the video.")
-    print(f"      → {len(frames)} frames at {fps:.1f} fps", flush=True)
-
-    # 2. Apex frame detection (on raw frames — no Eulerian magnification)
-    _log(2, TOTAL, "Apex frame detection (LBP + 3D-FFT)…")
-    spotter  = ApexFrameSpotter(t_window=min(61, len(frames)))
-    apex_idx, apex_score, _ = spotter.find_apex_in_short_video(frames)
-    print(f"      → apex frame: {apex_idx}  (score={apex_score:.2f})", flush=True)
-
-    # 3. Onset frame detection (sliding window)
-    _log(3, TOTAL, f"Onset frame detection (window={onset_window_size})…")
-    onset_idx = detect_onset_frame(frames, apex_idx, window_size=onset_window_size)
-    print(f"      → onset frame: {onset_idx}", flush=True)
-
-    onset_raw = frames[onset_idx]
-    apex_raw  = frames[apex_idx]
-
-    # 4. Face detection & crop (224×224 — matches generate_raft_flows.py)
-    _log(4, TOTAL, "Face detection & cropping (onset + apex)…")
-    onset_crop = align_and_crop_face(onset_raw, target_size=224)
-    apex_crop  = align_and_crop_face(apex_raw,  target_size=224)
-
-    # 5. MagNet amplification
-    _log(5, TOTAL, "MagNet motion amplification…")
-    apex_amplified = apply_magnet(onset_crop, apex_crop, magnet_model, device)
-
-    # 6. RAFT optical flow
-    _log(6, TOTAL, "Computing RAFT optical flow…")
-    flow     = compute_raft_flow(onset_crop, apex_amplified, raft_model, device)
-    flow_vis = flow_to_vis(flow)
-    print(f"      → flow shape: {flow.shape}", flush=True)
-
-    # 7. Model inference + pack results
-    _log(7, TOTAL, "Running DualCnnMER inference…")
-    result = run_inference(model, flow, apex_crop, device)
-    print(f"      → {result['emotion']}  conf={result['confidence']:.3f}", flush=True)
-
-    result.update({
-        "apex_frame_index":  int(apex_idx),
-        "onset_frame_index": int(onset_idx),
-        "total_frames":      len(frames),
-        "fps":               round(fps, 2),
-        "images": {
-            "onset":        encode_b64(onset_raw),
-            "apex":         encode_b64(apex_raw),
-            "onset_face":   encode_b64(onset_crop),
-            "apex_face":    encode_b64(apex_crop),
-            "magnified":    encode_b64(apex_amplified),
-            "optical_flow": encode_b64(flow_vis),
-        },
-    })
-
-    print("── Pipeline complete ────────────────────────────\n", flush=True)
-    return result
+    """Blocking wrapper around process_video_stream for simple request/response use."""
+    for event in process_video_stream(video_path, model, raft_model, magnet_model,
+                                      device, onset_window_size=onset_window_size):
+        if event.get("error"):
+            raise RuntimeError(event["error"])
+        if event.get("done"):
+            event.pop("done")
+            return event
