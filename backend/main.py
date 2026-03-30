@@ -47,18 +47,21 @@ if os.path.isdir(FRONTEND_DIR):
 
 CHECKPOINT_PATH = os.environ.get(
     "CHECKPOINT_PATH",
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "best_baseline.pth"),
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 "save_dual_cnn", "best_scl_dual_cnn_fold6_apex_rgb.pth"),
 )
 
-_model = None
-_device = None
+_model        = None
+_raft_model   = None
+_magnet_model = None
+_device       = None
 
 
 @app.on_event("startup")
 async def startup():
-    global _model, _device
-    _model, _device = load_model(CHECKPOINT_PATH)
-    print(f"[startup] Model ready on {_device}")
+    global _model, _raft_model, _magnet_model, _device
+    _model, _raft_model, _magnet_model, _device = load_model(CHECKPOINT_PATH)
+    print(f"[startup] Models ready on {_device}")
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -71,13 +74,13 @@ async def health():
 @app.post("/api/process")
 async def process(
     video: UploadFile = File(...),
-    magnify_alpha: float = Form(default=20.0),
+    magnify_alpha: float = Form(default=20.0),       # kept for API compat, unused now
+    onset_window_size: int = Form(default=15),
 ):
     """
     Accept a video file (mp4, webm, mov, avi), run the full pipeline,
     and return emotion classification + base64-encoded result images.
     """
-    # Determine suffix from content type or filename
     filename  = video.filename or "upload.mp4"
     suffix    = os.path.splitext(filename)[-1].lower() or ".mp4"
     allowed   = {".mp4", ".webm", ".mov", ".avi", ".mkv"}
@@ -90,7 +93,8 @@ async def process(
         tmp_path = tmp.name
 
     try:
-        result = process_video(tmp_path, _model, _device, magnify_alpha=magnify_alpha)
+        result = process_video(tmp_path, _model, _raft_model, _magnet_model, _device,
+                               onset_window_size=onset_window_size)
         return JSONResponse(result)
     except Exception as exc:
         traceback.print_exc()
