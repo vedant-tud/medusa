@@ -148,10 +148,16 @@ def main():
         sp_img = np.clip(sp_img, 0, 1)
         
         fl_img = flow_x[0].cpu().numpy()
-        fl_u, fl_v = fl_img[0] * 0.5 + 0.5, fl_img[1] * 0.5 + 0.5
-        fl_mag = np.sqrt(fl_u**2 + fl_v**2)
-        fl_mag = fl_mag / (np.max(fl_mag) + 1e-5)
-        fl_vis = np.stack([fl_mag]*3, axis=-1)
+        fl_u, fl_v = fl_img[0], fl_img[1]
+        
+        fl_mag, fl_ang = cv2.cartToPolar(fl_u, fl_v)
+        hsv = np.zeros((112, 112, 3), dtype=np.uint8)
+        hsv[..., 0] = fl_ang * 180 / np.pi / 2
+        hsv[..., 1] = 255
+        hsv[..., 2] = cv2.normalize(fl_mag, None, 0, 255, cv2.NORM_MINMAX)
+        bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        fl_vis = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        fl_vis = fl_vis.astype(np.float32) / 255.0
         
         # Overlay Heatmaps
         gc_sp_overlay, _ = overlay_heatmap(sp_img, cam_sp)
