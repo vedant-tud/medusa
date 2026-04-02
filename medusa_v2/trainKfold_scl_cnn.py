@@ -20,6 +20,10 @@ if os.path.exists(env_path):
 os.environ["TORCH_HOME"] = "/scratch/smiyyapuram/medusa/.cache/torch"
 os.environ["HF_HOME"] = "/scratch/smiyyapuram/medusa/.cache/huggingface"
 
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from medusa_plotter import create_summary_figure, summarize_predictions
 import gc
 import argparse
 import warnings
@@ -53,7 +57,7 @@ CONFIG = {
     "num_workers":      4,
     "save_path":        "./save_dual_cnn/best_scl_dual_cnn.pth",
     "frame_type":       "apex",  # 'onset' or 'apex'
-    "frame_channels":   "gray",  # 'gray' or 'rgb'
+    "frame_channels":   "rgb",  # 'gray' or 'rgb'
 }
 
 TARGET_CLASSES = {
@@ -149,7 +153,7 @@ class CasmeDualCNNDataset(Dataset):
 
         flow_path = row["flow_flip_npy"] if use_flip else row["flow_npy"]
         # Convert path to the original raw frames location
-        folder_orig = row["clip_folder"].replace("casme_raft_processed10", "casme_processed").replace("casme_raft_processed", "casme_processed")
+        folder_orig = row["clip_folder"].replace("casme_raft_processed10", "casme_processed").replace("casme_raft_processed", "casme_processed").replace("casme_tvl1_processed_amp5", "casme_processed")
         frame_path = os.path.join(folder_orig, f"{self.frame_type}.jpg")
 
         # --- STREAM 1: OPTICAL FLOW (U, V) ---
@@ -485,7 +489,7 @@ def train_one_epoch(model, loader, optimizer, criterion_cls, criterion_scl, devi
     return total_loss / max(total, 1), correct / max(total, 1)
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device) -> Tuple[float, float, float, float]:
+def evaluate(model, loader, criterion, device):
     model.eval()
     total_loss, all_preds, all_targets = 0.0, [], []
     for (x_f, x_s), y in tqdm(loader, desc="  eval ", leave=False):
@@ -496,10 +500,7 @@ def evaluate(model, loader, criterion, device) -> Tuple[float, float, float, flo
         all_preds.extend(logits.argmax(1).cpu().numpy())
         all_targets.extend(y.cpu().numpy())
     avg_loss = total_loss / max(len(all_targets), 1)
-    acc = np.mean(np.array(all_preds) == np.array(all_targets))
-    uar = recall_score(all_targets, all_preds, average='macro', zero_division=0)
-    uf1 = f1_score(all_targets, all_preds, average='macro', zero_division=0)
-    return avg_loss, acc, uar, uf1
+    return avg_loss, all_targets, all_preds
 
 def train(model, train_loader, val_loader, device, config, save_path, class_weights=None) -> List[Dict]:
     epochs, patience = config["epochs"], config["early_stop_patience"]
@@ -524,7 +525,10 @@ def train(model, train_loader, val_loader, device, config, save_path, class_weig
     for epoch in range(1, epochs + 1):
         lr = optimizer.param_groups[0]["lr"]
         train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion_cls, criterion_scl, device, config["grad_clip"])
-        val_loss, val_acc, val_uar, val_uf1 = evaluate(model, val_loader, criterion_cls, device)
+        val_loss, all_targets, all_preds = evaluate(model, val_loader, criterion_cls, device)
+        summ = summarize_predictions(all_targets, all_preds)
+        val_acc, val_uar, val_uf1, val_score = summ["acc"], summ["uar"], summ["uf1"], summ["score"]
+        val_cm = summ["confusion_matrix"]
         scheduler.step()
 
         is_best = val_uar > best_val_uar
@@ -538,7 +542,7 @@ def train(model, train_loader, val_loader, device, config, save_path, class_weig
         else:
             epochs_no_improve += 1
 
-        history.append({"epoch": epoch, "lr": lr, "train_loss": train_loss, "train_acc": train_acc, "val_loss": val_loss, "val_acc": val_acc, "val_uar": val_uar, "val_uf1": val_uf1})
+        history.append({"epoch": epoch, "lr": lr, "train_loss": train_loss, "train_acc": train_acc, "val_loss": val_loss, "val_acc": val_acc, "val_uar": val_uar, "val_uf1": val_uf1, "val_score": val_score, "cm": val_cm, "preds": all_preds, "targets": all_targets})
         
         if epochs_no_improve >= patience:
             print(f"Early stopping triggered after {patience} epochs without improvement.")
@@ -578,6 +582,13 @@ def run_kfold(annotations, config, device, pin_memory, k: int = 10):
     folds = np.array_split(rng.permutation(subjects), k)
     results = []
     
+    history_by_fold = {}
+    fold_confusions = {}
+    overall_targets = []
+    overall_preds = []
+    best_overall_uar = -1
+    best_fold = 1
+    
     spatial_chans = 1 if config['frame_channels'] == 'gray' else 3
 
     for fold_idx, val_subjects in enumerate(folds):
@@ -597,8 +608,18 @@ def run_kfold(annotations, config, device, pin_memory, k: int = 10):
         best_acc_for_ep = best_row["val_acc"]
         best_uar_for_ep = best_row["val_uar"]
         best_uf1_for_ep = best_row["val_uf1"]
+        best_score_for_ep = best_row["val_score"]
 
-        results.append({"fold": fold_idx + 1, "best_acc": best_acc_for_ep, "best_uar": best_uar_for_ep, "best_uf1": best_uf1_for_ep, "best_epoch": best_ep, "saved_model": save_path})
+        history_by_fold[fold_idx + 1] = pd.DataFrame(history)
+        fold_confusions[fold_idx + 1] = best_row["cm"]
+        overall_targets.extend(best_row["targets"])
+        overall_preds.extend(best_row["preds"])
+
+        if best_uar_for_ep > best_overall_uar:
+            best_overall_uar = best_uar_for_ep
+            best_fold = fold_idx + 1
+
+        results.append({"fold": fold_idx + 1, "best_acc": best_acc_for_ep, "best_uar": best_uar_for_ep, "best_uf1": best_uf1_for_ep, "best_score": best_score_for_ep, "best_epoch": best_ep, "saved_model": save_path})
         del model, train_loader, val_loader
         gc.collect()
         if device.type == "cuda": torch.cuda.empty_cache()
@@ -610,6 +631,10 @@ def run_kfold(annotations, config, device, pin_memory, k: int = 10):
     df = pd.DataFrame(results)
     csv_path = f"kfold{k}_dual_cnn_{config['frame_type']}_{config['frame_channels']}_results.csv"
     df.to_csv(csv_path, index=False)
+    
+    overall_summary = summarize_predictions(overall_targets, overall_preds)
+    plot_path = csv_path.replace(".csv", ".png")
+    create_summary_figure(plot_path, df, history_by_fold, fold_confusions, overall_summary, best_fold, k)
     
     print("\n" + "="*50)
     print(f"K-FOLD CROSS VALIDATION SUMMARY ({k} Folds)")
