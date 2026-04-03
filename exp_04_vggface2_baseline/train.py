@@ -88,7 +88,7 @@ def evaluate(model, loader, criterion, device, num_classes=3):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_root', type=str, default='/scratch/smiyyapuram/medusa/casme_raft_processed10')
-    parser.add_argument('--epochs', type=int, default=30)
+    parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--folds', type=int, default=10)
@@ -115,7 +115,7 @@ def main():
     overall_preds = []
     overall_history = {} # Will hold fold history mapped by fold number
     best_fold = 1
-    best_fold_uar = -1
+    best_fold_uf1 = -1
     
     for fold, (train_idx, val_idx) in enumerate(kf.split(df, y_full)):
         print(f"Fold {fold+1}/{args.folds}")
@@ -145,6 +145,7 @@ def main():
         
         model = DualStreamModel(num_classes=3).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3, min_lr=1e-6)
         criterion = WeightedFocalLoss(weight=class_weights_t, gamma=2.0)
         
         best_uar = -1.0
@@ -188,7 +189,7 @@ def main():
             fold_history.append(epoch_history)
             
             is_best = False
-            if summ['uar'] > best_uar:
+            if summ['uf1'] > best_uf1:
                 is_best = True
                 best_uar = summ['uar']
                 best_uf1 = summ['uf1']
@@ -201,6 +202,9 @@ def main():
                 
             best_marker = "(*Best*)" if is_best else ""
             print(f"Epoch {epoch+1:03d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {summ['acc']:.4f} | Val UAR: {summ['uar']:.4f} | Val UF1: {summ['uf1']:.4f} {best_marker}")
+            
+            # Step the scheduler based on Val UAR
+            scheduler.step(summ['uar'])
                 
         history_by_fold[fold+1] = pd.DataFrame(fold_history)
         overall_history[fold+1] = fold_history
@@ -216,8 +220,8 @@ def main():
             'best_score': best_score
         })
         
-        if best_uar > best_fold_uar:
-            best_fold_uar = best_uar
+        if best_uf1 > best_fold_uf1:
+            best_fold_uf1 = best_uf1
             best_fold = fold + 1
             
         print(f"Fold {fold+1} Best UAR: {best_uar:.4f} | Best UF1: {best_uf1:.4f}")

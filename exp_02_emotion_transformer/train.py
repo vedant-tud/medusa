@@ -88,7 +88,7 @@ def evaluate(model, loader, criterion, device, num_classes=3):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_root', type=str, default='/scratch/smiyyapuram/medusa/casme_raft_processed10')
-    parser.add_argument('--epochs', type=int, default=30)
+    parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--folds', type=int, default=10)
@@ -113,9 +113,9 @@ def main():
     fold_confusions = {}
     overall_targets = []
     overall_preds = []
-    overall_history = {}
+    overall_history = {} # Will hold fold history mapped by fold number
     best_fold = 1
-    best_fold_uar = -1
+    best_fold_uf1 = -1
     
     for fold, (train_idx, val_idx) in enumerate(kf.split(df, y_full)):
         print(f"Fold {fold+1}/{args.folds}")
@@ -137,8 +137,8 @@ def main():
         sample_weights = [class_weights[int(y)] for y in train_df['emotion_id'].values]
         sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
         
-        train_ds = CasmeDualSwinDataset(train_df, augment=True, frame_type=args.frame_type, frame_channels=args.channels)
-        val_ds = CasmeDualSwinDataset(val_df, augment=False, frame_type=args.frame_type, frame_channels=args.channels)
+        train_ds = CasmeDualSwinDataset(train_df, image_size=256, augment=True, frame_type=args.frame_type, frame_channels=args.channels)
+        val_ds = CasmeDualSwinDataset(val_df, image_size=256, augment=False, frame_type=args.frame_type, frame_channels=args.channels)
         
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler, num_workers=4, drop_last=True)
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
@@ -188,7 +188,7 @@ def main():
             fold_history.append(epoch_history)
             
             is_best = False
-            if summ['uar'] > best_uar:
+            if summ['uf1'] > best_uf1:
                 is_best = True
                 best_uar = summ['uar']
                 best_uf1 = summ['uf1']
@@ -216,8 +216,8 @@ def main():
             'best_score': best_score
         })
         
-        if best_uar > best_fold_uar:
-            best_fold_uar = best_uar
+        if best_uf1 > best_fold_uf1:
+            best_fold_uf1 = best_uf1
             best_fold = fold + 1
             
         print(f"Fold {fold+1} Best UAR: {best_uar:.4f} | Best UF1: {best_uf1:.4f}")
@@ -235,7 +235,7 @@ def main():
     try:
         exp_name = os.path.basename(os.path.dirname(os.path.abspath(__file__)))
         output_png = os.path.join(args.out_dir, f"{exp_name}_summary.png")
-        create_summary_figure(overall_history, overall_targets, overall_preds, fold_results, output_png)
+        create_summary_figure(output_png, res_df, history_by_fold, fold_confusions, overall_summary, best_fold, args.folds)
         print(f"Saved plot to {output_png}")
     except Exception as e:
         print(f"Failed to create summary figure: {e}")
