@@ -31,13 +31,26 @@ _face_cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 )
 
+<<<<<<< HEAD
 def align_and_crop_face(img: np.ndarray, target_size: int = 224) -> np.ndarray:
+=======
+def get_face_bbox(img: np.ndarray):
+>>>>>>> a8c09420fbe86c2de3ac7c90089612ea0d01b7f4
     gray  = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     faces = _face_cascade.detectMultiScale(
         gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60)
     )
     if len(faces) > 0:
+<<<<<<< HEAD
         x, y, w, h = faces[0]
+=======
+        return faces[0]
+    return None
+
+def crop_face(img: np.ndarray, bbox, target_size: int = 224) -> np.ndarray:
+    if bbox is not None:
+        x, y, w, h = bbox
+>>>>>>> a8c09420fbe86c2de3ac7c90089612ea0d01b7f4
         m  = int(0.15 * min(w, h))
         x1 = max(0, x - m);   y1 = max(0, y - m)
         x2 = min(img.shape[1], x + w + m);  y2 = min(img.shape[0], y + h + m)
@@ -48,7 +61,10 @@ def align_and_crop_face(img: np.ndarray, target_size: int = 224) -> np.ndarray:
     return cv2.resize(crop, (target_size, target_size))
 
 def prepare_for_raft(img_np):
+<<<<<<< HEAD
     # Convert numpy RGB (H, W, 3) to PyTorch tensor (1, 3, H, W) scaled to [-1, 1]
+=======
+>>>>>>> a8c09420fbe86c2de3ac7c90089612ea0d01b7f4
     img_t = torch.from_numpy(img_np).permute(2, 0, 1).float().unsqueeze(0).to(device)
     img_t = 2.0 * (img_t / 255.0) - 1.0
     return img_t
@@ -69,9 +85,16 @@ def process_video_clip(model, magnet_model, clip_path, out_clip_path, amp_factor
     onset_rgb = cv2.cvtColor(onset_img, cv2.COLOR_BGR2RGB)
     apex_rgb  = cv2.cvtColor(apex_img,  cv2.COLOR_BGR2RGB)
 
+<<<<<<< HEAD
     # Face align & crop
     onset_crop = align_and_crop_face(onset_rgb)
     apex_crop  = align_and_crop_face(apex_rgb)
+=======
+    # Face align & crop with SAME bounding box for both frames
+    bbox = get_face_bbox(onset_rgb)
+    onset_crop = crop_face(onset_rgb, bbox)
+    apex_crop  = crop_face(apex_rgb, bbox)
+>>>>>>> a8c09420fbe86c2de3ac7c90089612ea0d01b7f4
 
     # Convert to format required for MagNet
     onset_mag_input = torch.from_numpy(onset_crop).permute(2, 0, 1).float().unsqueeze(0).to(device) / 127.5 - 1.0 # (1, 3, H, W), -1 to 1

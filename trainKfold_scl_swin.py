@@ -38,21 +38,21 @@ from typing import Optional, List, Dict, Tuple
 
 CONFIG = {
     "data_root":        "./casme_raft_processed10",
-    "sample_log_path":  "./save_dual_swin/focal_loss_log_dual_swin.csv",
+    "sample_log_path":  "./save_dual_swin/scl_log_dual_swin.csv",
     "num_classes":      3,
     "image_size":       256,
     "pretrained":       True,
     "sample_per_class": 100,      
     "epochs":           100,      
     "early_stop_patience": 30,    
-    "batch_size":      8,
+    "batch_size":       32,
     "lr":               1e-4,
     "weight_decay":     1e-4,
     "grad_clip":        1.0,
     "warmup_epochs":    5,
     "seed":             42,
     "num_workers":      4,
-    "save_path":        "./save_dual_swin/best_focal_loss_dual_swin.pth",
+    "save_path":        "./save_dual_swin/best_scl_dual_swin.pth",
     "frame_type":       "apex",  # 'onset' or 'apex'
     "frame_channels":   "gray",  # 'gray' or 'rgb'
 }
@@ -130,9 +130,9 @@ def compute_class_weights(df: pd.DataFrame, num_classes: int, device: torch.devi
     counts = np.zeros(num_classes)
     for eid, cnt in df["emotion_id"].value_counts().items(): counts[int(eid)] = cnt
     counts = np.where(counts == 0, 1, counts)
-    # Using log1p to smooth weights for highly imbalanced classes
-    weights = 1.0 / np.log1p(counts)
-    weights = weights / weights.sum() * num_classes
+    # Using inverse class frequency to handle the massive 30:1 imbalance
+    total_samples = np.sum(counts)
+    weights = total_samples / (num_classes * counts)
     return torch.tensor(weights, dtype=torch.float32, device=device)
 
 def flow_to_rgb_heatmap(flow_npy: np.ndarray) -> np.ndarray:
@@ -264,41 +264,131 @@ class DualSwinMER(nn.Module):
         
         total_feat_dim = self.stream_motion.num_features + self.stream_spatial.num_features
         
-        self.classifier = nn.Sequential(
+        # Split classifier into encoder and head for SupCon
+        self.encoder = nn.Sequential(
             nn.LayerNorm(total_feat_dim),
             nn.Dropout(p=0.5),         
-            nn.Linear(total_feat_dim, num_classes),
         )
+        self.head = nn.Linear(total_feat_dim, num_classes)
 
-    def forward(self, flow_x: torch.Tensor, spatial_x: torch.Tensor, return_flow: bool = False):
+    def forward(self, flow_x: torch.Tensor, spatial_x: torch.Tensor, return_flow: bool = False, return_feat: bool = False):
         f_motion = self.stream_motion(flow_x)
         f_spatial = self.stream_spatial(spatial_x)
         f_fused = torch.cat((f_motion, f_spatial), dim=1)
-        logits = self.classifier(f_fused)
         
-        if return_flow:
+        embed = self.encoder(f_fused)
+        logits = self.head(embed)
+        
+        if return_flow and return_feat:
+            pred_flow = self.flow_decoder(f_spatial)
+            return logits, embed, pred_flow
+        elif return_flow:
             pred_flow = self.flow_decoder(f_spatial)
             return logits, pred_flow
+        elif return_feat:
+            return logits, embed
             
         return logits
 
-def train_one_epoch(model, loader, optimizer, criterion, device, grad_clip) -> Tuple[float, float]:
+class SupConLoss(nn.Module):
+    """Supervised Contrastive Learning: https://arxiv.org/pdf/2004.11362.pdf."""
+    def __init__(self, temperature=0.07, contrast_mode='all', base_temperature=0.07):
+        super(SupConLoss, self).__init__()
+        self.temperature = temperature
+        self.contrast_mode = contrast_mode
+        self.base_temperature = base_temperature
+
+    def forward(self, features, labels=None, mask=None):
+        device = features.device
+
+        if len(features.shape) == 2:
+            features = features.unsqueeze(1) # shape: [bsz, 1, embed_dim]
+
+        batch_size = features.shape[0]
+        if labels is not None and mask is not None:
+            raise ValueError('Cannot define both labels and mask')
+        elif labels is None and mask is None:
+            mask = torch.eye(batch_size, dtype=torch.float32).to(device)
+        elif labels is not None:
+            labels = labels.contiguous().view(-1, 1)
+            if labels.shape[0] != batch_size:
+                raise ValueError('Num of labels does not match num of features')
+            mask = torch.eq(labels, labels.T).float().to(device)
+        else:
+            mask = mask.float().to(device)
+
+        contrast_count = features.shape[1]
+        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
+        
+        # normalize features
+        contrast_feature = F.normalize(contrast_feature, p=2, dim=1)
+        
+        if self.contrast_mode == 'one':
+            anchor_feature = features[:, 0]
+            anchor_feature = F.normalize(anchor_feature, p=2, dim=1)
+            anchor_count = 1
+        elif self.contrast_mode == 'all':
+            anchor_feature = contrast_feature
+            anchor_count = contrast_count
+        else:
+            raise ValueError('Unknown mode: {}'.format(self.contrast_mode))
+
+        # compute logits
+        anchor_dot_contrast = torch.div(
+            torch.matmul(anchor_feature, contrast_feature.T),
+            self.temperature)
+        
+        # for numerical stability
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()
+
+        # tile mask
+        mask = mask.repeat(anchor_count, contrast_count)
+        
+        # mask-out self-contrast cases
+        logits_mask = torch.scatter(
+            torch.ones_like(mask),
+            1,
+            torch.arange(batch_size * anchor_count).view(-1, 1).to(device),
+            0
+        )
+        mask = mask * logits_mask
+
+        # compute log_prob
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-12)
+
+        # compute mean of log-likelihood over positive
+        mask_pos_pairs = mask.sum(1)
+        mask_pos_pairs = torch.where(mask_pos_pairs < 1e-6, 1, mask_pos_pairs)
+        mean_log_prob_pos = (mask * log_prob).sum(1) / mask_pos_pairs
+
+        # loss
+        loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
+        loss = loss.view(anchor_count, batch_size).mean()
+
+        return loss
+
+def train_one_epoch(model, loader, optimizer, criterion_cls, criterion_scl, device, grad_clip) -> Tuple[float, float]:
     model.train()
     total_loss, correct, total = 0.0, 0, 0
     for (x_f, x_s), y in tqdm(loader, desc="  train", leave=False):
         x_f, x_s, y = x_f.to(device), x_s.to(device), y.to(device)
         
-        # FDP-style Multi-Task: Forward pass returning optical flow reconstruction
-        logits, pred_flow = model(x_f, x_s, return_flow=True)
+        # SCL + FDP-style Multi-Task: Forward pass returning optical flow & embedded features
+        logits, embed, pred_flow = model(x_f, x_s, return_flow=True, return_feat=True)
         
-        # Primary Loss
-        cls_loss = criterion(logits, y)
+        # Primary Classification Loss
+        cls_loss = criterion_cls(logits, y)
+
+        # Contrastive Loss
+        scl_loss = criterion_scl(embed, y)
         
         # Auxiliary Task: MSE measuring reconstructed flow vs actual geometric flow
         aux_loss = torch.nn.functional.mse_loss(pred_flow, x_f)
         
-        # Total loss config: Weigh aux_loss so it guides features without overriding emotions
-        loss = cls_loss + (0.5 * aux_loss)
+        # Total loss config: CLS + 0.5 * SCL + 0.5 * AUX
+        loss = cls_loss + (0.5 * scl_loss) + (0.5 * aux_loss)
         
         optimizer.zero_grad()
         loss.backward()
@@ -329,9 +419,10 @@ def evaluate(model, loader, criterion, device) -> Tuple[float, float, float, flo
 
 def train(model, train_loader, val_loader, device, config, save_path, class_weights=None) -> List[Dict]:
     epochs, patience = config["epochs"], config["early_stop_patience"]
-    # We are using WeightedRandomSampler, so batches are perfectly balanced. 
-    # Therefore we do NOT use weighted loss or focal loss, just standard CrossEntropy.
-    criterion = nn.CrossEntropyLoss()
+    
+    # Use Focal Loss with class weights to handle imbalance without sample duplication
+    criterion_cls = WeightedFocalLoss(weight=class_weights, gamma=2.0)
+    criterion_scl = SupConLoss(temperature=0.1)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
 
@@ -348,8 +439,8 @@ def train(model, train_loader, val_loader, device, config, save_path, class_weig
 
     for epoch in range(1, epochs + 1):
         lr = optimizer.param_groups[0]["lr"]
-        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, device, config["grad_clip"])
-        val_loss, val_acc, val_uar, val_uf1 = evaluate(model, val_loader, criterion, device)
+        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion_cls, criterion_scl, device, config["grad_clip"])
+        val_loss, val_acc, val_uar, val_uf1 = evaluate(model, val_loader, criterion_cls, device)
         scheduler.step()
 
         is_best = val_uar > best_val_uar
@@ -371,41 +462,15 @@ def train(model, train_loader, val_loader, device, config, save_path, class_weig
 
     return history
 
-from torch.utils.data import WeightedRandomSampler
-
-def make_balanced_sampler(train_df: pd.DataFrame) -> WeightedRandomSampler:
-    """
-    Creates a PyTorch sampler that oversamples minority classes 
-    and undersamples majority classes to balance every batch.
-    """
-    # 1. Count occurrences of each class in this specific train split
-    class_counts = train_df["emotion_id"].value_counts().sort_index().values
-    
-    # 2. Smooth the weights with square root so it doesn't overcompensate for Surprise
-    class_weights = 1.0 / np.sqrt(class_counts)
-    
-    # 3. Assign the corresponding weight to every single sample in the dataframe
-    sample_weights = [class_weights[int(row["emotion_id"])] for _, row in train_df.iterrows()]
-    
-    # 4. Create the sampler (replacement=True is required to oversample)
-    sampler = WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=len(train_df), # Keeps the definition of "1 epoch" the same length
-        replacement=True 
-    )
-    return sampler
-
 def make_loaders(train_df, val_df, config, pin_memory):
     train_ds = CasmeDualSwinDataset(train_df, config["image_size"], augment=True, frame_type=config['frame_type'], frame_channels=config['frame_channels'])
     val_ds   = CasmeDualSwinDataset(val_df,   config["image_size"], augment=False, frame_type=config['frame_type'], frame_channels=config['frame_channels'])
     
-    # Initialize the balanced sampler for the training set
-    train_sampler = make_balanced_sampler(train_df)
-    
+    # Use standard shuffling to preserve variety, paired with Focal and SCL loss.
     train_loader = DataLoader(
         train_ds, 
         batch_size=config["batch_size"], 
-        sampler=train_sampler, 
+        shuffle=True, 
         drop_last=True, 
         num_workers=config["num_workers"], 
         pin_memory=pin_memory, 
