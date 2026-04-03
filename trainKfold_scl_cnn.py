@@ -1,8 +1,9 @@
 """
-train_dual_swin_flexible.py
-Dual-Stream Swin TransformerMER
-Stream 1: Optical Flow (HSV->RGB, 3-channels)
+train_dual_cnn_flexible.py
+Dual-Stream Custom CNN MER
+Stream 1: Optical Flow (U/V channels, 2-channels)
 Stream 2: Frame Image (Apex or Onset | Gray or RGB)
+Uses a Custom lightweight CNN structure natively built to avoid ResNet-18 overfitting.
 """
 
 import os
@@ -32,27 +33,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-import timm
 from tqdm import tqdm
 from typing import Optional, List, Dict, Tuple
 
 CONFIG = {
     "data_root":        "./casme_raft_processed10",
-    "sample_log_path":  "./save_dual_swin/focal_loss_log_dual_swin.csv",
+    "sample_log_path":  "./save_dual_cnn/scl_log_dual_cnn.csv",
     "num_classes":      3,
-    "image_size":       256,
-    "pretrained":       True,
+    "image_size":       112,
     "sample_per_class": 100,      
     "epochs":           100,      
     "early_stop_patience": 30,    
-    "batch_size":      8,
-    "lr":               1e-4,
-    "weight_decay":     1e-4,
+    "batch_size":       32,
+    "lr":               1e-5,
+    "weight_decay":     1e-2,
     "grad_clip":        1.0,
     "warmup_epochs":    5,
     "seed":             42,
     "num_workers":      4,
-    "save_path":        "./save_dual_swin/best_focal_loss_dual_swin.pth",
+    "save_path":        "./save_dual_cnn/best_scl_dual_cnn.pth",
     "frame_type":       "apex",  # 'onset' or 'apex'
     "frame_channels":   "gray",  # 'gray' or 'rgb'
 }
@@ -63,9 +62,6 @@ TARGET_CLASSES = {
 }
 LABEL_MAP = {"positive":  0, "negative":  1, "surprise":  2}
 ID_TO_LABEL = {v: k for k, v in LABEL_MAP.items()}
-
-IMAGENET_MEAN = [0.5, 0.5, 0.5]
-IMAGENET_STD  = [0.5, 0.5, 0.5]
 
 def get_device() -> torch.device:
     if torch.cuda.is_available(): return torch.device("cuda")
@@ -88,7 +84,7 @@ def _parse_info_txt(path: str) -> Optional[dict]:
 
 def load_casme_processed(data_root: str) -> pd.DataFrame:
     records = []
-    if not os.path.isdir(data_root): raise FileNotFoundError()
+    if not os.path.isdir(data_root): raise FileNotFoundError(f"Missing {data_root}")
     for subj_dir in sorted(os.listdir(data_root)):
         subj_path = os.path.join(data_root, subj_dir)
         if not os.path.isdir(subj_path): continue
@@ -130,33 +126,16 @@ def compute_class_weights(df: pd.DataFrame, num_classes: int, device: torch.devi
     counts = np.zeros(num_classes)
     for eid, cnt in df["emotion_id"].value_counts().items(): counts[int(eid)] = cnt
     counts = np.where(counts == 0, 1, counts)
-    # Using log1p to smooth weights for highly imbalanced classes
-    weights = 1.0 / np.log1p(counts)
-    weights = weights / weights.sum() * num_classes
+    # Using inverse class frequency to handle the massive 30:1 imbalance
+    total_samples = np.sum(counts)
+    weights = total_samples / (num_classes * counts)
     return torch.tensor(weights, dtype=torch.float32, device=device)
 
-def flow_to_rgb_heatmap(flow_npy: np.ndarray) -> np.ndarray:
-    flow = flow_npy.transpose(1, 2, 0)
-    u, v = flow[..., 0], flow[..., 1]
-    mag, ang = cv2.cartToPolar(u, v)
-    hsv = np.zeros((flow.shape[0], flow.shape[1], 3), dtype=np.uint8)
-    hsv[..., 0] = ang * 180 / np.pi / 2
-    hsv[..., 1] = 255
-    max_mag = np.max(mag)
-    if max_mag > 1e-5: hsv[..., 2] = (mag / max_mag) * 255
-    else: hsv[..., 2] = 0
-    rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
-    return (rgb.astype(np.float32) / 255.0).transpose(2, 0, 1)
-
-def _make_transform(augment: bool) -> transforms.Compose:
-    return transforms.Compose([transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)])
-
-class CasmeDualSwinDataset(Dataset):
-    def __init__(self, annotations: pd.DataFrame, image_size: int = 256, augment: bool = False, frame_type='apex', frame_channels='gray'):
+class CasmeDualCNNDataset(Dataset):
+    def __init__(self, annotations: pd.DataFrame, image_size: int = 112, augment: bool = False, frame_type='apex', frame_channels='gray'):
         self.df = annotations.reset_index(drop=True)
         self.size = image_size
         self.augment = augment
-        self.transform = _make_transform(augment)
         self.frame_type = frame_type
         self.frame_channels = frame_channels
         self.eraser = transforms.RandomErasing(p=0.25, scale=(0.02, 0.10)) if augment else None
@@ -167,21 +146,38 @@ class CasmeDualSwinDataset(Dataset):
         row = self.df.iloc[idx]
         label = int(row["emotion_id"])
         use_flip = self.augment and (torch.rand(1).item() > 0.5)
-        
+
         flow_path = row["flow_flip_npy"] if use_flip else row["flow_npy"]
-        # Find spatial image in casme_processed folder structure
+        # Convert path to the original raw frames location
         folder_orig = row["clip_folder"].replace("casme_raft_processed10", "casme_processed").replace("casme_raft_processed", "casme_processed")
         frame_path = os.path.join(folder_orig, f"{self.frame_type}.jpg")
 
-        # --- STREAM 1: OPTICAL FLOW ---
+        # --- STREAM 1: OPTICAL FLOW (U, V) ---
         try: flow = np.load(flow_path).astype(np.float32) 
         except: flow = np.zeros((2, self.size, self.size), dtype=np.float32)
 
         if flow.shape[1] != self.size or flow.shape[2] != self.size:
             flow = cv2.resize(flow.transpose(1, 2, 0), (self.size, self.size)).transpose(2, 0, 1)
 
-        rgb_heatmap = flow_to_rgb_heatmap(flow)
-        tensor_flow = self.transform(torch.from_numpy(rgb_heatmap))
+        u, v = flow[0], flow[1]
+        max_mag = np.max(np.sqrt(u**2 + v**2))
+        
+        # Normalize to [0,1]
+        if max_mag > 1e-5:
+            u_norm = (u / max_mag + 1.0) / 2.0
+            v_norm = (v / max_mag + 1.0) / 2.0
+        else:
+            u_norm = np.full_like(u, 0.5)
+            v_norm = np.full_like(v, 0.5)
+
+        if self.augment:
+            noise = 0.02
+            u_norm = np.clip(u_norm + np.random.normal(0, noise, u_norm.shape), 0, 1)
+            v_norm = np.clip(v_norm + np.random.normal(0, noise, v_norm.shape), 0, 1)
+
+        # Shift to [-1, 1]
+        tensor_flow = torch.from_numpy(np.stack([u_norm, v_norm], axis=0)).float()
+        tensor_flow = (tensor_flow - 0.5) / 0.5
 
         # --- STREAM 2: SPATIAL STRUCTURE ---
         frame_img = cv2.imread(frame_path, cv2.IMREAD_COLOR)
@@ -195,10 +191,10 @@ class CasmeDualSwinDataset(Dataset):
         if self.frame_channels == 'gray':
             frame_img = cv2.cvtColor(frame_img, cv2.COLOR_RGB2GRAY)
             tensor_spatial = torch.from_numpy(frame_img).unsqueeze(0).float() / 255.0
-            tensor_spatial = transforms.Normalize([0.5], [0.5])(tensor_spatial)
+            tensor_spatial = (tensor_spatial - 0.5) / 0.5
         else:
             tensor_spatial = torch.from_numpy(frame_img).permute(2, 0, 1).float() / 255.0
-            tensor_spatial = transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)(tensor_spatial)
+            tensor_spatial = (tensor_spatial - 0.5) / 0.5
 
         if self.augment and self.eraser is not None:
             tensor_flow = self.eraser(tensor_flow)
@@ -206,6 +202,198 @@ class CasmeDualSwinDataset(Dataset):
 
         return (tensor_flow, tensor_spatial), label
 
+# --- ARCHITECTURE MATCHING THE IPYNB ---
+
+class FlowCNNBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, pool: bool = True):
+        super().__init__()
+        layers = [
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        ]
+        if pool:
+            layers.append(nn.MaxPool2d(2, 2))
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.block(x)
+
+class CustomCNNStream(nn.Module):
+    def __init__(self, in_channels: int):
+        super().__init__()
+        self.features = nn.Sequential(
+            FlowCNNBlock(in_channels, 32,  pool=True),   
+            FlowCNNBlock(32,  64,  pool=True),   
+            FlowCNNBlock(64,  128, pool=True),   
+            FlowCNNBlock(128, 128, pool=False),  
+            nn.AdaptiveAvgPool2d((4, 4)),         
+        )
+    def forward(self, x):
+        return self.features(x)
+
+class CNNFlowDecoder(nn.Module):
+    def __init__(self, in_channels=128, out_channels=2):
+        super().__init__()
+        # Input: (Batch, 128, 4, 4)
+        # Up-sampling progressively to reconstruct (Batch, 2, 112, 112)
+        self.deconv = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), # 8x8
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            
+            nn.Upsample(size=(14, 14), mode='bilinear', align_corners=False), # 14x14
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), # 28x28
+            nn.Conv2d(32, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), # 56x56
+            nn.Conv2d(16, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), # 112x112
+            nn.Conv2d(16, out_channels, kernel_size=3, padding=1)
+        )
+
+    def forward(self, x):
+        return self.deconv(x)
+
+
+class DualCnnMER(nn.Module):
+    def __init__(self, num_classes: int = 3, spatial_chans: int = 1):
+        super().__init__()
+        self.stream_motion = CustomCNNStream(in_channels=2)
+        self.stream_spatial = CustomCNNStream(in_channels=spatial_chans)
+        
+        # Decoder for Auxiliary Task: Reconstructing optical flow
+        self.flow_decoder = CNNFlowDecoder(in_channels=128, out_channels=2)
+        
+        self.encoder = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(p=0.5),
+            nn.Linear(2 * 128 * 4 * 4, 256),  # 4096 -> 256
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+        )
+        
+        self.head = nn.Sequential(
+            nn.Dropout(p=0.4),
+            nn.Linear(256, num_classes)
+        )
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm1d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, flow_x: torch.Tensor, spatial_x: torch.Tensor, return_flow: bool = False, return_feat: bool = False):
+        f_motion = self.stream_motion(flow_x)
+        f_spatial = self.stream_spatial(spatial_x)
+        f_fused = torch.cat((f_motion, f_spatial), dim=1)
+        embed = self.encoder(f_fused)
+        logits = self.head(embed)
+        
+        if return_flow and return_feat:
+            pred_flow = self.flow_decoder(f_spatial)
+            return logits, embed, pred_flow
+        elif return_flow:
+            pred_flow = self.flow_decoder(f_spatial)
+            return logits, pred_flow
+        elif return_feat:
+            return logits, embed
+            
+        return logits
+
+class SupConLoss(nn.Module):
+    """Supervised Contrastive Learning: https://arxiv.org/pdf/2004.11362.pdf."""
+    def __init__(self, temperature=0.07, contrast_mode='all', base_temperature=0.07):
+        super(SupConLoss, self).__init__()
+        self.temperature = temperature
+        self.contrast_mode = contrast_mode
+        self.base_temperature = base_temperature
+
+    def forward(self, features, labels=None, mask=None):
+        device = features.device
+
+        if len(features.shape) == 2:
+            features = features.unsqueeze(1) # shape: [bsz, 1, embed_dim]
+
+        batch_size = features.shape[0]
+        if labels is not None and mask is not None:
+            raise ValueError('Cannot define both labels and mask')
+        elif labels is None and mask is None:
+            mask = torch.eye(batch_size, dtype=torch.float32).to(device)
+        elif labels is not None:
+            labels = labels.contiguous().view(-1, 1)
+            if labels.shape[0] != batch_size:
+                raise ValueError('Num of labels does not match num of features')
+            mask = torch.eq(labels, labels.T).float().to(device)
+        else:
+            mask = mask.float().to(device)
+
+        contrast_count = features.shape[1]
+        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
+        
+        # normalize features
+        contrast_feature = F.normalize(contrast_feature, p=2, dim=1)
+        
+        if self.contrast_mode == 'one':
+            anchor_feature = features[:, 0]
+            anchor_feature = F.normalize(anchor_feature, p=2, dim=1)
+            anchor_count = 1
+        elif self.contrast_mode == 'all':
+            anchor_feature = contrast_feature
+            anchor_count = contrast_count
+        else:
+            raise ValueError('Unknown mode: {}'.format(self.contrast_mode))
+
+        # compute logits
+        anchor_dot_contrast = torch.div(
+            torch.matmul(anchor_feature, contrast_feature.T),
+            self.temperature)
+        
+        # for numerical stability
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()
+
+        # tile mask
+        mask = mask.repeat(anchor_count, contrast_count)
+        
+        # mask-out self-contrast cases
+        logits_mask = torch.scatter(
+            torch.ones_like(mask),
+            1,
+            torch.arange(batch_size * anchor_count).view(-1, 1).to(device),
+            0
+        )
+        mask = mask * logits_mask
+
+        # compute log_prob
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-12)
+
+        # compute mean of log-likelihood over positive
+        mask_pos_pairs = mask.sum(1)
+        mask_pos_pairs = torch.where(mask_pos_pairs < 1e-6, 1, mask_pos_pairs)
+        mean_log_prob_pos = (mask * log_prob).sum(1) / mask_pos_pairs
+
+        # loss
+        loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
+        loss = loss.view(anchor_count, batch_size).mean()
+
+        return loss
 
 class WeightedFocalLoss(nn.Module):
     def __init__(self, weight: Optional[torch.Tensor] = None, gamma: float = 3.0):
@@ -225,86 +413,31 @@ class WeightedFocalLoss(nn.Module):
             focal_loss = focal_loss * self.weight[targets]
         return focal_loss.mean()
 
-class FlowDecoder(nn.Module):
-    def __init__(self, in_features, out_channels=3):
-        super().__init__()
-        # Project 768-dim global feature back to 256 * 8 * 8 spatial
-        self.fc = nn.Linear(in_features, 256 * 8 * 8)
-        self.deconv = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1), # 16x16
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),  # 32x32
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),   # 64x64
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),   # 128x128
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(16, out_channels, kernel_size=4, stride=2, padding=1) # 256x256
-        )
-
-    def forward(self, x):
-        x = self.fc(x)
-        x = x.view(-1, 256, 8, 8)
-        return self.deconv(x)
-
-
-class DualSwinMER(nn.Module):
-    def __init__(self, num_classes: int = 3, pretrained: bool = True, spatial_chans: int = 1):
-        super().__init__()
-        
-        self.stream_motion = timm.create_model("swinv2_tiny_window8_256", pretrained=pretrained, num_classes=0, in_chans=3)
-        self.stream_spatial = timm.create_model("swinv2_tiny_window8_256", pretrained=pretrained, num_classes=0, in_chans=spatial_chans)
-        
-        # Decoder for Auxiliary Task: Reconstructing optical flow
-        self.flow_decoder = FlowDecoder(self.stream_spatial.num_features, out_channels=3)
-        
-        total_feat_dim = self.stream_motion.num_features + self.stream_spatial.num_features
-        
-        self.classifier = nn.Sequential(
-            nn.LayerNorm(total_feat_dim),
-            nn.Dropout(p=0.5),         
-            nn.Linear(total_feat_dim, num_classes),
-        )
-
-    def forward(self, flow_x: torch.Tensor, spatial_x: torch.Tensor, return_flow: bool = False):
-        f_motion = self.stream_motion(flow_x)
-        f_spatial = self.stream_spatial(spatial_x)
-        f_fused = torch.cat((f_motion, f_spatial), dim=1)
-        logits = self.classifier(f_fused)
-        
-        if return_flow:
-            pred_flow = self.flow_decoder(f_spatial)
-            return logits, pred_flow
-            
-        return logits
-
-def train_one_epoch(model, loader, optimizer, criterion, device, grad_clip) -> Tuple[float, float]:
+def train_one_epoch(model, loader, optimizer, criterion_cls, criterion_scl, device, grad_clip) -> Tuple[float, float]:
     model.train()
     total_loss, correct, total = 0.0, 0, 0
     for (x_f, x_s), y in tqdm(loader, desc="  train", leave=False):
         x_f, x_s, y = x_f.to(device), x_s.to(device), y.to(device)
         
-        # FDP-style Multi-Task: Forward pass returning optical flow reconstruction
-        logits, pred_flow = model(x_f, x_s, return_flow=True)
+        # SCL + FDP-style Multi-Task: Forward pass returning optical flow & embedded features
+        logits, embed, pred_flow = model(x_f, x_s, return_flow=True, return_feat=True)
         
-        # Primary Loss
-        cls_loss = criterion(logits, y)
+        # Primary Classification Loss
+        cls_loss = criterion_cls(logits, y)
+
+        # Contrastive Loss
+        scl_loss = criterion_scl(embed, y)
         
         # Auxiliary Task: MSE measuring reconstructed flow vs actual geometric flow
         aux_loss = torch.nn.functional.mse_loss(pred_flow, x_f)
         
-        # Total loss config: Weigh aux_loss so it guides features without overriding emotions
-        loss = cls_loss + (0.5 * aux_loss)
+        # Total loss config: CLS + 0.5 * SCL + 0.5 * AUX
+        loss = cls_loss + (0.5 * scl_loss) + (0.5 * aux_loss)
         
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
-        
         total_loss += loss.item() * y.size(0)
         correct    += (logits.argmax(1) == y).sum().item()
         total      += y.size(0)
@@ -329,9 +462,10 @@ def evaluate(model, loader, criterion, device) -> Tuple[float, float, float, flo
 
 def train(model, train_loader, val_loader, device, config, save_path, class_weights=None) -> List[Dict]:
     epochs, patience = config["epochs"], config["early_stop_patience"]
-    # We are using WeightedRandomSampler, so batches are perfectly balanced. 
-    # Therefore we do NOT use weighted loss or focal loss, just standard CrossEntropy.
-    criterion = nn.CrossEntropyLoss()
+    
+    # Use Focal Loss with class weights to handle imbalance without sample duplication
+    criterion_cls = WeightedFocalLoss(weight=class_weights, gamma=2.0)
+    criterion_scl = SupConLoss(temperature=0.1)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
 
@@ -348,8 +482,8 @@ def train(model, train_loader, val_loader, device, config, save_path, class_weig
 
     for epoch in range(1, epochs + 1):
         lr = optimizer.param_groups[0]["lr"]
-        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, device, config["grad_clip"])
-        val_loss, val_acc, val_uar, val_uf1 = evaluate(model, val_loader, criterion, device)
+        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion_cls, criterion_scl, device, config["grad_clip"])
+        val_loss, val_acc, val_uar, val_uf1 = evaluate(model, val_loader, criterion_cls, device)
         scheduler.step()
 
         is_best = val_uar > best_val_uar
@@ -371,41 +505,15 @@ def train(model, train_loader, val_loader, device, config, save_path, class_weig
 
     return history
 
-from torch.utils.data import WeightedRandomSampler
-
-def make_balanced_sampler(train_df: pd.DataFrame) -> WeightedRandomSampler:
-    """
-    Creates a PyTorch sampler that oversamples minority classes 
-    and undersamples majority classes to balance every batch.
-    """
-    # 1. Count occurrences of each class in this specific train split
-    class_counts = train_df["emotion_id"].value_counts().sort_index().values
-    
-    # 2. Smooth the weights with square root so it doesn't overcompensate for Surprise
-    class_weights = 1.0 / np.sqrt(class_counts)
-    
-    # 3. Assign the corresponding weight to every single sample in the dataframe
-    sample_weights = [class_weights[int(row["emotion_id"])] for _, row in train_df.iterrows()]
-    
-    # 4. Create the sampler (replacement=True is required to oversample)
-    sampler = WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=len(train_df), # Keeps the definition of "1 epoch" the same length
-        replacement=True 
-    )
-    return sampler
-
 def make_loaders(train_df, val_df, config, pin_memory):
-    train_ds = CasmeDualSwinDataset(train_df, config["image_size"], augment=True, frame_type=config['frame_type'], frame_channels=config['frame_channels'])
-    val_ds   = CasmeDualSwinDataset(val_df,   config["image_size"], augment=False, frame_type=config['frame_type'], frame_channels=config['frame_channels'])
+    train_ds = CasmeDualCNNDataset(train_df, config["image_size"], augment=True, frame_type=config['frame_type'], frame_channels=config['frame_channels'])
+    val_ds   = CasmeDualCNNDataset(val_df,   config["image_size"], augment=False, frame_type=config['frame_type'], frame_channels=config['frame_channels'])
     
-    # Initialize the balanced sampler for the training set
-    train_sampler = make_balanced_sampler(train_df)
-    
+    # Use standard shuffling to preserve variety, paired with Focal and SCL loss.
     train_loader = DataLoader(
         train_ds, 
         batch_size=config["batch_size"], 
-        sampler=train_sampler, 
+        shuffle=True, 
         drop_last=True, 
         num_workers=config["num_workers"], 
         pin_memory=pin_memory, 
@@ -439,7 +547,7 @@ def run_kfold(annotations, config, device, pin_memory, k: int = 10):
 
         class_weights = compute_class_weights(train_df, config["num_classes"], device)
         train_loader, val_loader = make_loaders(train_df, val_df, config, pin_memory)
-        model = DualSwinMER(config["num_classes"], config["pretrained"], spatial_chans=spatial_chans).to(device)
+        model = DualCnnMER(config["num_classes"], spatial_chans=spatial_chans).to(device)
         save_path = config["save_path"].replace(".pth", f"_fold{fold_idx+1}_{config['frame_type']}_{config['frame_channels']}.pth")
 
         history = train(model, train_loader, val_loader, device, config, save_path, class_weights)
@@ -459,12 +567,12 @@ def run_kfold(annotations, config, device, pin_memory, k: int = 10):
         print("-" * 50 + "\n")
         
     df = pd.DataFrame(results)
-    csv_path = f"kfold{k}_dual_swin_{config['frame_type']}_{config['frame_channels']}_results.csv"
+    csv_path = f"kfold{k}_dual_cnn_{config['frame_type']}_{config['frame_channels']}_results.csv"
     df.to_csv(csv_path, index=False)
     
     print("\n" + "="*50)
     print(f"K-FOLD CROSS VALIDATION SUMMARY ({k} Folds)")
-    print(f"Model: Dual Swin | Frame: {config['frame_type']} | Channels: {config['frame_channels']}")
+    print(f"Model: Dual CNN | Frame: {config['frame_type']} | Channels: {config['frame_channels']}")
     print("="*50)
     print(df.to_string(index=False))
     print("-" * 50)
