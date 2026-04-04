@@ -1,8 +1,0 @@
-experiment=exp_01_dual_resnet50_flow_swinv2_spatial
-subject=sub162
-clip=sub162/c_303_374
-branch=dual
-true=Negative
-pred=Negative
-checkpoint=/scratch/smiyyapuram/medusa/exp_01_face_id_baseline/save_models/best_model_fold1.pth
-load_mode=strict

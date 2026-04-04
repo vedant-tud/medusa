@@ -1,8 +1,0 @@
-experiment=exp_02_dual_swinv2_flow_resnet50_spatial
-subject=sub187
-clip=sub187/l_4178_4188
-branch=dual
-true=Negative
-pred=Negative
-checkpoint=/scratch/smiyyapuram/medusa/exp_02_emotion_transformer/save_models/best_model_fold1.pth
-load_mode=strict

@@ -1,8 +1,0 @@
-experiment=exp_03_dual_convnext_flow_vit_spatial
-subject=sub187
-clip=sub187/l_4178_4188
-branch=dual
-true=Negative
-pred=Negative
-checkpoint=/scratch/smiyyapuram/medusa/exp_03_all_emotion/save_models/best_model_fold1.pth
-load_mode=strict

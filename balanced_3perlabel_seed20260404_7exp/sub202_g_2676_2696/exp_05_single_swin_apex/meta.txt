@@ -1,8 +1,0 @@
-experiment=exp_05_single_swin_apex
-subject=sub202
-clip=sub202/g_2676_2696
-branch=spatial
-true=Negative
-pred=Negative
-checkpoint=/scratch/smiyyapuram/medusa/exp_06_single_swin_apex/save_models/best_model_fold1.pth
-load_mode=strict

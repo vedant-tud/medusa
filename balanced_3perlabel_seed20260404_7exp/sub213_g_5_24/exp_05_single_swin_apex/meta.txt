@@ -1,8 +1,0 @@
-experiment=exp_05_single_swin_apex
-subject=sub213
-clip=sub213/g_5_24
-branch=spatial
-true=Surprise
-pred=Surprise
-checkpoint=/scratch/smiyyapuram/medusa/exp_06_single_swin_apex/save_models/best_model_fold1.pth
-load_mode=strict
