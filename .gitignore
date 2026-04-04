@@ -1,19 +1,78 @@
-data/*
-casme_processed/
-*desktop.ini
+# Python environments
 .venv/
 .venv_medusa/
+venv/
+env/
 __pycache__/
-*.zip
+*.pyc
+*.pyo
+*.egg-info/
+.Python
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*desktop.ini
+
+# Environment
 .env
+.env.local
+
+# Data & Cache
+data/*
+casme_processed/
+casme_processed/*
+casme_raft_processed*/*
+.cache/*
+.torch/
+
+# Experiment artifacts (not needed for inference)
+saved_dual_cnn/*
+balanced_3perlabel_seed20260404_7exp/*
+balanced_3perlabel_seed20260404_7exp.zip
+/exp_01_face_id_baseline/*
+/exp_03_all_emotion/*
+/exp_04_vggface2_baseline/*
+/exp_06_single_swin_apex/*
+/exp_07_single_resent_flow/*
+/flow_test/*
+/Map per experiment/*
+/medusa_v2/*
+
+# Training artifacts
+*.zip
+*.tar.gz
+*.tar
 ./best_baseline_subj1.pth
 ./best_baseline_subj2.pth
 ./best_baseline_subj3.pth
 ./quick_test.pth
 ./sample_log.csv
 ./baseline_mer.ipynb
-casme_processed/*
-casme_raft_processed*/*
-.cache/*
-saved_dual_cnn/*
+slurm_script.sh
+environment.yml
 
+# Test outputs & logs
+*.log
+*.csv
+runs/
+logs/
+results/
+
+# Large model files (except necessary checkpoints)
+*.pth
+!exp_02_emotion_transformer/best_model_fold4.pth
+!motion_amp/magnet_epoch12_loss7.28e-02.pth
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+!motion_amp/VMM_learning_based_demo.ipynb
+
+# System
+.medusa_v2.zip
+medusa_v2.zip
