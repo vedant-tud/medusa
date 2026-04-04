@@ -65,8 +65,6 @@ results/
 
 # Large model files (except necessary checkpoints)
 *.pth
-!exp_02_emotion_transformer/best_model_fold4.pth
-!motion_amp/magnet_epoch12_loss7.28e-02.pth
 
 # Jupyter
 .ipynb_checkpoints/
