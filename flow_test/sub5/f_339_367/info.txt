@@ -1,0 +1,5 @@
+Subject: 5
+Video: f
+Onset: 339
+Apex: 367
+Emotion: fear
