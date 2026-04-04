@@ -1,0 +1,8 @@
+experiment=exp_05_single_swin_apex
+subject=sub207
+clip=sub207/k_27_42
+branch=spatial
+true=Positive
+pred=Positive
+checkpoint=/scratch/smiyyapuram/medusa/exp_06_single_swin_apex/save_models/best_model_fold1.pth
+load_mode=strict

@@ -8,3 +8,6 @@ __pycache__/
 casme_processed/*
 casme_raft_processed*/*
 .cache/*
+medusa_env/*
+logs/*
+casme_tvl1_processed_amp5/*
