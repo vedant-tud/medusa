@@ -69,7 +69,7 @@ results/
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb
-!motion_amp/VMM_learning_based_demo.ipynb
+
 
 # System
 .medusa_v2.zip
