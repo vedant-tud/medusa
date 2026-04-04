@@ -6,12 +6,12 @@ class DualStreamModel(nn.Module):
     def __init__(self, num_classes=3, dropout_rate=0.5):
         super().__init__()
         
-        # Stream 1: Timm Resnet50
+        # Stream 1: Timm Resnet50 for flow (motion)
         self.stream1 = timm.create_model('resnet50', pretrained=True, num_classes=0)
             
         # Note: insightface returns embedding of size 512 normally
         
-        # Stream 2: swinv2_tiny_window8_256
+        # Stream 2: swinv2_tiny_window8_256 for spatial (face)
         self.stream2 = timm.create_model('swinv2_tiny_window8_256', pretrained=True, num_classes=0)
         
         # Try to infer feature shapes
@@ -47,17 +47,8 @@ class DualStreamModel(nn.Module):
         )
         
     def forward(self, x1, x2):
-        # x1: spatial (apex), x2: motion (flow)
-        # However, insightface model expects specific inputs; if we fallback to timm it expects standard tensors.
-        if hasattr(self.stream1, 'forward'):
-            try:
-                out1 = self.stream1(x1)
-            except:
-                # If InsightFace throws error since it expects numpy BGR images or specific structure
-                # We might need to handle it in dataset or simply use timm proxy.
-                out1 = self.stream1(x1)
-        else:
-            out1 = self.stream1(x1)
+        # x1: flow, x2: spatial RGB. 
+        out1 = self.stream1(x1)
             
         # out1 from insightface might need flattening if it returns namedtuple or similar depending on loaded model
         if not isinstance(out1, torch.Tensor):

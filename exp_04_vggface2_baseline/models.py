@@ -48,7 +48,7 @@ class DualStreamModel(nn.Module):
         )
         
     def forward(self, x1, x2):
-        # x1: spatial (apex), x2: motion (flow)
+        # x1: flow, x2: apex RGB.
         # However, insightface model expects specific inputs; if we fallback to timm it expects standard tensors.
         if hasattr(self.stream1, 'forward'):
             try:
