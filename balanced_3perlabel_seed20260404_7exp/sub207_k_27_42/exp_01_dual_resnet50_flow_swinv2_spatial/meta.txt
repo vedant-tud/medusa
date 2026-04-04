@@ -1,0 +1,8 @@
+experiment=exp_01_dual_resnet50_flow_swinv2_spatial
+subject=sub207
+clip=sub207/k_27_42
+branch=dual
+true=Positive
+pred=Positive
+checkpoint=/scratch/smiyyapuram/medusa/exp_01_face_id_baseline/save_models/best_model_fold1.pth
+load_mode=strict

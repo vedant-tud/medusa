@@ -1,0 +1,8 @@
+experiment=exp_00_dual_cnn_scl_auxflow
+subject=sub162
+clip=sub162/c_303_374
+branch=dual
+true=Negative
+pred=Negative
+checkpoint=/scratch/smiyyapuram/medusa/medusa_v2/save_dual_cnn/best_scl_dual_cnn_fold1_apex_rgb.pth
+load_mode=strict

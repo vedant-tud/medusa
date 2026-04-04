@@ -1,0 +1,8 @@
+experiment=exp_06_single_resnet_flow
+subject=sub159
+clip=sub159/j_1176_1220
+branch=flow
+true=Positive
+pred=Positive
+checkpoint=/scratch/smiyyapuram/medusa/exp_07_single_resnet_flow/save_models/best_model_fold1.pth
+load_mode=strict

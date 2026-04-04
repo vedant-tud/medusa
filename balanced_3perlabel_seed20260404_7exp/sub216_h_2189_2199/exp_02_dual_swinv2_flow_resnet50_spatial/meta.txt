@@ -1,0 +1,8 @@
+experiment=exp_02_dual_swinv2_flow_resnet50_spatial
+subject=sub216
+clip=sub216/h_2189_2199
+branch=dual
+true=Surprise
+pred=Surprise
+checkpoint=/scratch/smiyyapuram/medusa/exp_02_emotion_transformer/save_models/best_model_fold1.pth
+load_mode=strict
