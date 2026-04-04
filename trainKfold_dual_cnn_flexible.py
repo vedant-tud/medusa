@@ -8,18 +8,6 @@ Uses a Custom lightweight CNN structure natively built to avoid ResNet-18 overfi
 
 import os
 
-<<<<<<< HEAD
-=======
-# --- Set Local Caching & Load .env ---
-env_path = os.path.join(os.getcwd(), ".env")
-if os.path.exists(env_path):
-    with open(env_path, "r") as f:
-        for line in f:
-            if line.strip() and not line.startswith("#") and "=" in line:
-                key, val = line.strip().split("=", 1)
-                os.environ[key] = val
-
->>>>>>> a8c09420fbe86c2de3ac7c90089612ea0d01b7f4
 os.environ["TORCH_HOME"] = "/scratch/smiyyapuram/medusa/.cache/torch"
 os.environ["HF_HOME"] = "/scratch/smiyyapuram/medusa/.cache/huggingface"
 
@@ -235,8 +223,6 @@ class CustomCNNStream(nn.Module):
     def forward(self, x):
         return self.features(x)
 
-<<<<<<< HEAD
-=======
 class CNNFlowDecoder(nn.Module):
     def __init__(self, in_channels=128, out_channels=2):
         super().__init__()
@@ -271,19 +257,15 @@ class CNNFlowDecoder(nn.Module):
         return self.deconv(x)
 
 
->>>>>>> a8c09420fbe86c2de3ac7c90089612ea0d01b7f4
 class DualCnnMER(nn.Module):
     def __init__(self, num_classes: int = 3, spatial_chans: int = 1):
         super().__init__()
         self.stream_motion = CustomCNNStream(in_channels=2)
         self.stream_spatial = CustomCNNStream(in_channels=spatial_chans)
         
-<<<<<<< HEAD
-=======
         # Decoder for Auxiliary Task: Reconstructing optical flow
         self.flow_decoder = CNNFlowDecoder(in_channels=128, out_channels=2)
         
->>>>>>> a8c09420fbe86c2de3ac7c90089612ea0d01b7f4
         self.classifier = nn.Sequential(
             nn.Flatten(),
             nn.Dropout(p=0.5),
@@ -304,13 +286,6 @@ class DualCnnMER(nn.Module):
                 nn.init.xavier_normal_(m.weight)
                 nn.init.zeros_(m.bias)
 
-<<<<<<< HEAD
-    def forward(self, flow_x: torch.Tensor, spatial_x: torch.Tensor) -> torch.Tensor:
-        f_motion = self.stream_motion(flow_x)
-        f_spatial = self.stream_spatial(spatial_x)
-        f_fused = torch.cat((f_motion, f_spatial), dim=1)
-        return self.classifier(f_fused)
-=======
     def forward(self, flow_x: torch.Tensor, spatial_x: torch.Tensor, return_flow: bool = False):
         f_motion = self.stream_motion(flow_x)
         f_spatial = self.stream_spatial(spatial_x)
@@ -322,7 +297,6 @@ class DualCnnMER(nn.Module):
             return logits, pred_flow
             
         return logits
->>>>>>> a8c09420fbe86c2de3ac7c90089612ea0d01b7f4
 
 class WeightedFocalLoss(nn.Module):
     def __init__(self, weight: Optional[torch.Tensor] = None, gamma: float = 3.0):
@@ -347,10 +321,6 @@ def train_one_epoch(model, loader, optimizer, criterion, device, grad_clip) -> T
     total_loss, correct, total = 0.0, 0, 0
     for (x_f, x_s), y in tqdm(loader, desc="  train", leave=False):
         x_f, x_s, y = x_f.to(device), x_s.to(device), y.to(device)
-<<<<<<< HEAD
-        logits = model(x_f, x_s)
-        loss   = criterion(logits, y)
-=======
         
         # FDP-style Multi-Task: Forward pass returning optical flow reconstruction
         logits, pred_flow = model(x_f, x_s, return_flow=True)
@@ -364,7 +334,6 @@ def train_one_epoch(model, loader, optimizer, criterion, device, grad_clip) -> T
         # Total loss config: Weigh aux_loss so it guides features without overriding emotions
         loss = cls_loss + (0.5 * aux_loss)
         
->>>>>>> a8c09420fbe86c2de3ac7c90089612ea0d01b7f4
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -393,21 +362,11 @@ def evaluate(model, loader, criterion, device) -> Tuple[float, float, float, flo
 
 def train(model, train_loader, val_loader, device, config, save_path, class_weights=None) -> List[Dict]:
     epochs, patience = config["epochs"], config["early_stop_patience"]
-<<<<<<< HEAD
-    criterion = WeightedFocalLoss(weight=class_weights)
-
-    optimizer = torch.optim.AdamW([
-        {"params": model.stream_motion.parameters(),  "lr": config["lr"] * 0.1},
-        {"params": model.stream_spatial.parameters(), "lr": config["lr"] * 0.1},
-        {"params": model.classifier.parameters(),     "lr": config["lr"]},
-    ], weight_decay=config["weight_decay"])
-=======
     # We are using WeightedRandomSampler, so batches are perfectly balanced. 
     # Therefore we do NOT use weighted loss or focal loss, just standard CrossEntropy.
     criterion = nn.CrossEntropyLoss()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], weight_decay=config["weight_decay"])
->>>>>>> a8c09420fbe86c2de3ac7c90089612ea0d01b7f4
 
     warmup = config["warmup_epochs"]
     def lr_lambda(epoch):
@@ -421,11 +380,7 @@ def train(model, train_loader, val_loader, device, config, save_path, class_weig
     epochs_no_improve = 0
 
     for epoch in range(1, epochs + 1):
-<<<<<<< HEAD
-        lr = optimizer.param_groups[1]["lr"]
-=======
         lr = optimizer.param_groups[0]["lr"]
->>>>>>> a8c09420fbe86c2de3ac7c90089612ea0d01b7f4
         train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, criterion, device, config["grad_clip"])
         val_loss, val_acc, val_uar, val_uf1 = evaluate(model, val_loader, criterion, device)
         scheduler.step()
@@ -449,8 +404,6 @@ def train(model, train_loader, val_loader, device, config, save_path, class_weig
 
     return history
 
-<<<<<<< HEAD
-=======
 from torch.utils.data import WeightedRandomSampler
 
 def make_balanced_sampler(train_df: pd.DataFrame) -> WeightedRandomSampler:
@@ -475,21 +428,10 @@ def make_balanced_sampler(train_df: pd.DataFrame) -> WeightedRandomSampler:
     )
     return sampler
 
->>>>>>> a8c09420fbe86c2de3ac7c90089612ea0d01b7f4
 def make_loaders(train_df, val_df, config, pin_memory):
     train_ds = CasmeDualCNNDataset(train_df, config["image_size"], augment=True, frame_type=config['frame_type'], frame_channels=config['frame_channels'])
     val_ds   = CasmeDualCNNDataset(val_df,   config["image_size"], augment=False, frame_type=config['frame_type'], frame_channels=config['frame_channels'])
     
-<<<<<<< HEAD
-    from torch.utils.data import WeightedRandomSampler
-    counts = train_df["emotion_id"].value_counts().to_dict()
-    class_weights_dict = {k: 1.0 / counts.get(k, 1) for k in range(config["num_classes"])}
-    sample_weights = [class_weights_dict[row["emotion_id"]] for _, row in train_df.iterrows()]
-    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
-    
-    train_loader = DataLoader(train_ds, batch_size=config["batch_size"], sampler=sampler, drop_last=True, num_workers=config["num_workers"], pin_memory=pin_memory, persistent_workers=(config["num_workers"] > 0))
-    val_loader   = DataLoader(val_ds,   batch_size=config["batch_size"], shuffle=False, drop_last=False, num_workers=config["num_workers"], pin_memory=pin_memory, persistent_workers=(config["num_workers"] > 0))
-=======
     # Initialize the balanced sampler for the training set
     train_sampler = make_balanced_sampler(train_df)
     
@@ -512,7 +454,6 @@ def make_loaders(train_df, val_df, config, pin_memory):
         pin_memory=pin_memory, 
         persistent_workers=(config["num_workers"] > 0)
     )
->>>>>>> a8c09420fbe86c2de3ac7c90089612ea0d01b7f4
     return train_loader, val_loader
 
 def run_kfold(annotations, config, device, pin_memory, k: int = 10):

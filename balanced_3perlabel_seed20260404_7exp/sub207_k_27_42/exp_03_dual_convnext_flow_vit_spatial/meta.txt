@@ -1,0 +1,8 @@
+experiment=exp_03_dual_convnext_flow_vit_spatial
+subject=sub207
+clip=sub207/k_27_42
+branch=dual
+true=Positive
+pred=Positive
+checkpoint=/scratch/smiyyapuram/medusa/exp_03_all_emotion/save_models/best_model_fold1.pth
+load_mode=strict

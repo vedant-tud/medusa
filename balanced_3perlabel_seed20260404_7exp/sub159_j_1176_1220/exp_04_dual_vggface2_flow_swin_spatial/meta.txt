@@ -1,0 +1,8 @@
+experiment=exp_04_dual_vggface2_flow_swin_spatial
+subject=sub159
+clip=sub159/j_1176_1220
+branch=dual
+true=Positive
+pred=Positive
+checkpoint=/scratch/smiyyapuram/medusa/exp_04_vggface2_baseline/save_models/best_model_fold1.pth
+load_mode=strict
