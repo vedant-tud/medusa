@@ -36,6 +36,7 @@ balanced_3perlabel_seed20260404_7exp.zip
 flow_test/*
 Map\ per\ experiment/*
 medusa_v2/*
+EXPERIMENTS/*
 
 # Training artifacts
 *.zip
