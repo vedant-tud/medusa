@@ -122,6 +122,44 @@ ls -lh exp_02_emotion_transformer/best_model_fold4.pth
 
 The checkpoint contains the trained DualStreamModel weights.
 
+## Running Inference
+
+### Quick Test (Single Video)
+
+```bash
+python backend/test_inference.py \
+    --video path/to/test_video.mp4 \
+    --model exp_02_emotion_transformer/best_model_fold4.pth
+```
+
+Example:
+```bash
+python backend/test_inference.py \
+    --video test_video.mp4 \
+    --model exp_02_emotion_transformer/best_model_fold4.pth \
+    --device cuda
+```
+
+Output will show:
+- Detected apex and onset frames
+- Emotion classification (positive, negative, or surprise)
+- Confidence score and probabilities
+- Inference timing
+
+### Running the Backend Server
+
+Start the FastAPI server:
+
+```bash
+uvicorn backend.main:app --reload --port 8000
+```
+
+Then open your browser and go to:
+```
+http://localhost:8000/docs
+```
+
+This will open the interactive API documentation (Swagger UI) where you can test the inference endpoint directly.
 
 ## Pipeline Flow
 
