@@ -1,5 +1,0 @@
-Subject: 5
-Video: j
-Onset: 73
-Apex: 87
-Emotion: happiness
