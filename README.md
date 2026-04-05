@@ -308,7 +308,7 @@ plt.show()
 
 ## Exploring Other Models & Experiments
 
-For additional models and experiments, check the **[`feature/New-UI`](https://github.com/vedant-tud/medusa/tree/feature/New-UI)** branch, which contains:
+For additional models and experiments, check the **[`Experiments`](https://github.com/vedant-tud/medusa/tree/Experiments)** branch, which contains:
 - Extended model variations
 - Additional emotion datasets
 - UI components for visualization
