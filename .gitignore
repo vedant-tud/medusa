@@ -87,3 +87,20 @@ plot_cm.py
 
 save_dual_cnn/*
 
+exp_01_face_id_baseline/*
+exp_04_vggface2_baseline/*
+exp_06_single_swin_apex/*
+exp_07_single_resent_flow/*
+
+flow_test/*
+medusa_v2/*
+saved_dual_cnn/*
+exp02_architecture.html
+medusa_plotter.py
+plot_cm.py
+readme.md
+
+.ds_store
+.DS_Store
+BRANCH_SUMMARY.md
+PIPELINE_UPGRADE_PLAN.md
