@@ -74,3 +74,16 @@ results/
 # System
 .medusa_v2.zip
 medusa_v2.zip
+
+
+*.sh
+*.csv
+
+train_dual_cnn.py
+train_kfold.py
+
+medusa_plotter.py
+plot_cm.py
+
+save_dual_cnn/*
+
