@@ -25,36 +25,40 @@ __pycache__/
 # Data & Cache
 data/*
 casme_processed/
-casme_processed/*
 casme_raft_processed*/*
 .cache/*
 .torch/
 
 # Experiment artifacts (not needed for inference)
+exp_01_face_id_baseline/*
+exp_03_all_emotion/*
+exp_04_vggface2_baseline/*
+exp_06_single_swin_apex/*
+exp_07_single_resent_flow/*
 saved_dual_cnn/*
 balanced_3perlabel_seed20260404_7exp/*
 balanced_3perlabel_seed20260404_7exp.zip
-/exp_01_face_id_baseline/*
-/exp_03_all_emotion/*
-/exp_04_vggface2_baseline/*
-/exp_06_single_swin_apex/*
-/exp_07_single_resent_flow/*
-/flow_test/*
-/Map per experiment/*
-/medusa_v2/*
+flow_test/*
+Map\ per\ experiment/*
+medusa_v2/*
 
 # Training artifacts
 *.zip
 *.tar.gz
 *.tar
-./best_baseline_subj1.pth
-./best_baseline_subj2.pth
-./best_baseline_subj3.pth
-./quick_test.pth
-./sample_log.csv
-./baseline_mer.ipynb
-slurm_script.sh
 environment.yml
+baseline_mer.ipynb
+best_baseline_subj1.pth
+best_baseline_subj2.pth
+best_baseline_subj3.pth
+quick_test.pth
+sample_log.csv
+train_dual_cnn.py
+train_kfold.py
+medusa_plotter.py
+plot_cm.py
+exp02_architecture.html
+readme.md
 
 # Test outputs & logs
 *.log
@@ -63,44 +67,15 @@ runs/
 logs/
 results/
 
-# Large model files (except necessary checkpoints)
+# Large model files (keep necessary checkpoints via !important pattern below)
 *.pth
+
 
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb
 
-
 # System
 .medusa_v2.zip
 medusa_v2.zip
-
-
-*.sh
-*.csv
-
-train_dual_cnn.py
-train_kfold.py
-
-medusa_plotter.py
-plot_cm.py
-
-save_dual_cnn/*
-
-exp_01_face_id_baseline/*
-exp_04_vggface2_baseline/*
-exp_06_single_swin_apex/*
-exp_07_single_resent_flow/*
-
-flow_test/*
-medusa_v2/*
-saved_dual_cnn/*
-exp02_architecture.html
-medusa_plotter.py
-plot_cm.py
-readme.md
-
 .ds_store
-.DS_Store
-BRANCH_SUMMARY.md
-PIPELINE_UPGRADE_PLAN.md
