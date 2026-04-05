@@ -30,11 +30,6 @@ casme_raft_processed*/*
 .torch/
 
 # Experiment artifacts (not needed for inference)
-exp_01_face_id_baseline/*
-exp_03_all_emotion/*
-exp_04_vggface2_baseline/*
-exp_06_single_swin_apex/*
-exp_07_single_resent_flow/*
 saved_dual_cnn/*
 balanced_3perlabel_seed20260404_7exp/*
 balanced_3perlabel_seed20260404_7exp.zip
