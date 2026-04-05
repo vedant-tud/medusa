@@ -13,9 +13,8 @@ This branch contains the complete folder structure and setup instructions for te
 ## System Requirements
 
 - **Python**: 3.10+ (tested with 3.13)
-- **CUDA**: 11.8+ (recommended for GPU acceleration)
 - **RAM**: 8GB+ (16GB recommended)
-- **GPU**: NVIDIA GPU with CUDA support (optional but recommended)
+- **GPU**: NVIDIA GPU with CUDA support (optional, for faster inference)
 
 ## Folder Structure
 
@@ -133,7 +132,7 @@ python backend/test_inference.py \
     --model exp_02_emotion_transformer/best_model_fold4.pth
 ```
 
-Example with sample video:
+Example:
 ```bash
 python backend/test_inference.py \
     --video test_video.mp4 \
@@ -141,49 +140,11 @@ python backend/test_inference.py \
     --device cuda
 ```
 
-### Using the Backend API
-
-Start the FastAPI server:
-
-```bash
-uvicorn backend.main:app --reload --port 8000
-```
-
-Send a video for processing:
-
-```bash
-curl -X POST -F "file=@video.mp4" http://localhost:8000/process
-```
-
-Response example:
-```json
-{
-  "emotion": "positive",
-  "group": "positive",
-  "confidence": 0.87,
-  "group_probs": {
-    "positive": 0.87,
-    "negative": 0.08,
-    "surprise": 0.05
-  },
-  "all_probs": {
-    "positive": 0.87,
-    "negative": 0.08,
-    "surprise": 0.05
-  },
-  "apex_frame_index": 42,
-  "onset_frame_index": 15,
-  "total_frames": 120,
-  "fps": 30.0,
-  "images": {
-    "onset": "data:image/jpeg;base64,...",
-    "apex": "data:image/jpeg;base64,...",
-    "onset_face": "data:image/jpeg;base64,...",
-    "apex_face": "data:image/jpeg;base64,...",
-    "optical_flow": "data:image/jpeg;base64,..."
-  }
-}
-```
+Output will show:
+- Detected apex and onset frames
+- Emotion classification (positive, negative, or surprise)
+- Confidence score and probabilities
+- Inference timing
 
 ## Pipeline Flow
 
@@ -270,22 +231,6 @@ Before running on production:
 - [ ] API endpoint responds with emotion + confidence
 - [ ] Base64 images decode correctly
 
-## Performance Expectations
-
-On NVIDIA GPU (RTX 3080, 1080p input):
-
-| Step | Time | Notes |
-|------|------|-------|
-| Video load + RGB conversion | 0.5-1.5s | Depends on codec, duration |
-| Apex detection (3D-FFT) | 0.5-2s | Window size based on video length |
-| Onset detection (sliding window) | 0.3-1s | Window=15, typically 1 pass |
-| MTCNN face detection + crop | 0.2-0.5s | Per frame, cached detector |
-| TVL1 optical flow | 0.5-1.5s | 256×256 images |
-| DualStreamModel inference | 0.1-0.2s | Batch size 1 |
-| **Total** | **2-6s** | Typical end-to-end |
-
-**CPU inference**: 5-10x slower (15-60s total)
-
 ## Troubleshooting
 
 ### ImportError: No module named 'facenet_pytorch'
@@ -367,14 +312,6 @@ plt.title("Optical Flow Visualization")
 plt.show()
 ```
 
-### Adding Custom Preprocessing
-
-Edit `backend/pipeline.py`:
-- Lines 303-304: Face crop size
-- Line 314: TVL1 amplification factor
-- Line 194: Image preprocessing size
-- Lines 204-217: Normalization constants
-
 ## File References
 
 | File | Purpose | Key Lines |
@@ -392,8 +329,15 @@ Edit `backend/pipeline.py`:
 - **MTCNN**: [Joint Face Detection and Alignment using Multi-task Cascaded CNNs](https://arxiv.org/abs/1604.02878)
 - **Swin Transformer**: [Swin Transformer: Hierarchical Vision Transformer using Shifted Windows](https://arxiv.org/abs/2103.14030)
 
----
+## Exploring Other Models & Experiments
 
-**Status**: Ready for testing  
-**Last Updated**: 2026-04-04  
-**Maintained By**: Team
+For additional models and experiments, check the **[`feature/New-UI`](https://github.com/vedant-tud/medusa/tree/feature/New-UI)** branch, which contains:
+- Extended model variations
+- Additional emotion datasets
+- UI components for visualization
+- Other experimental implementations
+
+Switch to that branch to explore alternative approaches:
+```bash
+git checkout feature/New-UI
+```
