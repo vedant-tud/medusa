@@ -316,5 +316,5 @@ For additional models and experiments, check the **[`Experiments`](https://githu
 
 Switch to that branch to explore alternative approaches:
 ```bash
-git checkout feature/New-UI
+git checkout Experiments
 ```
